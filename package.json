@@ -1,20 +1,21 @@
+```json
 {
   "name": "whatsapp-server",
-  "version": "2.0.0",
-  "description": "WhatsApp Server com Baileys para Render",
+  "version": "4.1.0",
+  "description": "VoxyAI WhatsApp Server - Render Free",
   "main": "servidor.js",
   "scripts": {
-    "start": "node servidor.js",
-    "dev": "node servidor.js"
+    "start": "node servidor.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "express": "^4.21.2",
-    "cors": "^2.8.5",
-    "@whiskeysockets/baileys": "^6.7.16",
-    "@hapi/boom": "^10.0.1",
-    "pino": "^9.6.0"
   }
 }
+```
