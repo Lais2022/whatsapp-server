@@ -1,8 +1,4 @@
-# ==============================================
-# RENDER.YAML - Deploy Automático Render Free
-# Cole este arquivo no seu repositório GitHub
-# ==============================================
-
+```yaml
 services:
   - type: web
     name: whatsapp-server
@@ -14,4 +10,5 @@ services:
       - key: NODE_ENV
         value: production
       - key: SELF_URL
-        sync: false  # Você vai preencher manualmente após o deploy
+        sync: false
+```
