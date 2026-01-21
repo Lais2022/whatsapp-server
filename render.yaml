@@ -1,7 +1,15 @@
+# ==============================================
+# RENDER.YAML - Deploy Automático Render Free
+# Cole este arquivo no seu repositório GitHub
+# ==============================================
+
 services:
   - type: web
     name: whatsapp-server
     runtime: docker
+    # IMPORTANTE: aponta pro diretório do backend
+    dockerContext: standalone-project/backend
+    dockerfilePath: standalone-project/backend/Dockerfile
     region: oregon
     plan: free
     healthCheckPath: /health
@@ -9,4 +17,4 @@ services:
       - key: NODE_ENV
         value: production
       - key: SELF_URL
-        sync: false  # Você vai preencher manualmente após o deploy
+        sync: false  # Preencha manualmente após o deploy com a URL do Render
