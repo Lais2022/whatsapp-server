@@ -1,8 +1,7 @@
-```json
 {
-  "name": "whatsapp-server",
+  "name": "voxyai-whatsapp-server",
   "version": "4.1.0",
-  "description": "VoxyAI WhatsApp Server - Render Free",
+  "description": "Servidor WhatsApp para VoxyAI CRM - Render Free Edition",
   "main": "servidor.js",
   "scripts": {
     "start": "node servidor.js"
@@ -10,12 +9,11 @@
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.16",
     "cors": "^2.8.5",
-    "express": "^4.21.0",
-    "pino": "^9.4.0",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
     "qrcode": "^1.5.4"
   },
   "engines": {
     "node": ">=18.0.0"
   }
 }
-```
