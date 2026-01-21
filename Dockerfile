@@ -1,11 +1,15 @@
 FROM node:20-slim
 
-# Instala git e openssh-client (npm precisa do ssh instalado mesmo que redirecionemos)
+# Instala TUDO que precisa incluindo ca-certificates
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git openssh-client ffmpeg && \
+    apt-get install -y --no-install-recommends \
+    git \
+    openssh-client \
+    ca-certificates \
+    ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
-# FORÇA git a usar HTTPS em vez de SSH (ANTES do npm install)
+# Força HTTPS e desabilita verificação SSL temporariamente
 RUN git config --global url."https://github.com/".insteadOf "git@github.com:" && \
     git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
@@ -13,8 +17,7 @@ WORKDIR /app
 
 COPY package*.json ./
 
-# Limpa cache npm e instala
-RUN npm cache clean --force && npm install --omit=dev
+RUN npm install --omit=dev
 
 COPY . .
 
