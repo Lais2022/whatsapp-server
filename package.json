@@ -1,7 +1,7 @@
 {
   "name": "voxyai-whatsapp-server",
   "version": "4.1.0",
-  "description": "Servidor WhatsApp para VoxyAI CRM - Render Free Edition",
+  "description": "Servidor WhatsApp VoxyAI",
   "main": "servidor.js",
   "scripts": {
     "start": "node servidor.js"
