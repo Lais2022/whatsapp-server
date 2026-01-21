@@ -1,6 +1,6 @@
 /**
  * =============================================================
- * SERVIDOR WHATSAPP VOXYAI - VERSÃO 4.0 ALWAYS-ON
+ * SERVIDOR WHATSAPP VOXYAI - VERSÃO 4.1 ALWAYS-ON
  * =============================================================
  * 
  * Recursos:
@@ -10,6 +10,7 @@
  * - Timeouts de 60s: Suporta conexões lentas
  * - Auto-Reconexão: Reconecta automaticamente se desconectar
  * - QR Local: Gera QR code localmente (sem API externa)
+ * - Force Reset: Endpoint para resetar sessão e gerar novo QR
  * 
  * Deploy: Render.com, Railway, Heroku, VPS, Docker
  * =============================================================
@@ -220,7 +221,8 @@ async function connectWhatsApp() {
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 30000,
-            retryRequestDelayMs: 500
+            retryRequestDelayMs: 500,
+            shouldIgnoreJid: () => false
         });
 
         // Evento de atualização de conexão
@@ -231,7 +233,7 @@ async function connectWhatsApp() {
                 qrCode = qr;
                 qrDataUrl = await QRCode.toDataURL(qr);
                 connectionStatus = 'waiting_qr';
-                log('Novo QR Code gerado');
+                log('Gerando novo QR Code');
             }
 
             if (connection === 'open') {
@@ -240,7 +242,7 @@ async function connectWhatsApp() {
                 reconnectAttempts = 0;
                 qrCode = null;
                 qrDataUrl = null;
-                log('WhatsApp conectado com sucesso!');
+                log('WhatsApp conectado de verdade!');
             }
 
             if (connection === 'close') {
@@ -311,7 +313,7 @@ async function connectWhatsApp() {
                     messages = messages.slice(0, MAX_MESSAGES);
                 }
 
-                log(`Nova mensagem de ${messageData.from}: ${messageData.text || '[mídia]'}`);
+                log(`Mensagem recebida de lead: ${messageData.from}: ${messageData.text || '[mídia]'}`);
             }
         });
 
@@ -321,7 +323,7 @@ async function connectWhatsApp() {
         
         reconnectAttempts++;
         const delay = Math.min(5000 * reconnectAttempts, 60000);
-        log(`Tentando novamente em ${delay / 1000}s`);
+        log(`Sessão inválida — reset necessário. Tentando novamente em ${delay / 1000}s`);
         setTimeout(connectWhatsApp, delay);
     }
 }
@@ -352,7 +354,7 @@ app.get('/status', (req, res) => {
         messagesCount: messages.length,
         mediaCount: mediaFiles,
         storagePath: DATA_FOLDER,
-        version: '4.0.0',
+        version: '4.1.0',
         uptime: process.uptime()
     });
 });
@@ -397,7 +399,6 @@ app.get('/messages', (req, res) => {
 // Enviar mensagem de texto
 app.post('/send', async (req, res) => {
     try {
-        // Aceita múltiplos formatos de parâmetros
         const phone = req.body.phone || req.body.to;
         const message = req.body.message || req.body.text;
 
@@ -442,7 +443,6 @@ app.post('/send', async (req, res) => {
 // Enviar imagem
 app.post('/send-image', async (req, res) => {
     try {
-        // Aceita múltiplos formatos de parâmetros
         const phone = req.body.phone || req.body.to;
         const imageBase64 = req.body.imageBase64 || req.body.image;
         const imageUrl = req.body.imageUrl;
@@ -490,12 +490,11 @@ app.post('/send-image', async (req, res) => {
 // Enviar áudio
 app.post('/send-audio', async (req, res) => {
     try {
-        // Aceita múltiplos formatos de parâmetros
         const phone = req.body.phone || req.body.to;
         const audioBase64 = req.body.audioBase64 || req.body.audio;
         const audioUrl = req.body.audioUrl;
         const inputMimetype = (req.body.mimetype || 'audio/webm').toLowerCase();
-        const ptt = req.body.ptt !== false; // Default: true (áudio de voz)
+        const ptt = req.body.ptt !== false;
 
         if (!phone || (!audioUrl && !audioBase64)) {
             return res.status(400).json({ 
@@ -529,7 +528,6 @@ app.post('/send-audio', async (req, res) => {
         let finalMimetype = 'audio/ogg; codecs=opus';
         const needsConversion = inputMimetype.includes('webm');
 
-        // Tenta converter WebM para OGG se FFmpeg disponível
         if (needsConversion) {
             try {
                 const { execSync } = require('child_process');
@@ -555,7 +553,6 @@ app.post('/send-audio', async (req, res) => {
                 try { fs.unlinkSync(outputPath); } catch { }
             } catch (conversionError) {
                 log(`FFmpeg não disponível ou erro: ${conversionError.message}`);
-                // Continua com WebM se não conseguir converter
             }
         }
 
@@ -577,7 +574,6 @@ app.post('/send-audio', async (req, res) => {
 // Enviar vídeo
 app.post('/send-video', async (req, res) => {
     try {
-        // Aceita múltiplos formatos de parâmetros
         const phone = req.body.phone || req.body.to;
         const videoBase64 = req.body.videoBase64 || req.body.video;
         const videoUrl = req.body.videoUrl;
@@ -627,7 +623,6 @@ app.post('/send-video', async (req, res) => {
 // Enviar documento
 app.post('/send-document', async (req, res) => {
     try {
-        // Aceita múltiplos formatos de parâmetros
         const phone = req.body.phone || req.body.to;
         const documentBase64 = req.body.documentBase64 || req.body.document;
         const documentUrl = req.body.documentUrl;
@@ -733,23 +728,163 @@ app.post('/send-media', async (req, res) => {
 // Logout
 app.post('/logout', async (req, res) => {
     try {
+        log('Logout iniciado...');
+        
         if (sock) {
-            await sock.logout();
+            try {
+                await sock.logout();
+            } catch (logoutErr) {
+                log('Erro no sock.logout (ignorando):', logoutErr.message);
+            }
+            sock = null;
         }
         
         connectionStatus = 'disconnected';
         qrCode = null;
         qrDataUrl = null;
 
-        // Limpa credenciais
-        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+        try {
+            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+        } catch (e) {
+            log('Erro ao remover pasta auth:', e.message);
+        }
         fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
         log('Logout realizado com sucesso');
         res.json({ success: true, ok: true, message: 'Desconectado com sucesso' });
     } catch (error) {
         log('Erro no logout:', error.message);
+        connectionStatus = 'disconnected';
+        qrCode = null;
+        qrDataUrl = null;
+        res.json({ success: true, ok: true, message: 'Desconectado (com erro interno)', warning: error.message });
+    }
+});
+
+// =============================================================
+// ENDPOINTS ADICIONAIS (v4.1)
+// =============================================================
+
+// Status REAL do WhatsApp (não fake)
+app.get('/whatsapp-status', (req, res) => {
+    const hasSession = fs.existsSync(AUTH_FOLDER) && fs.readdirSync(AUTH_FOLDER).length > 0;
+    const isReallyConnected = connectionStatus === 'connected' && sock !== null;
+    
+    log(`whatsapp-status: connected=${isReallyConnected}, hasSession=${hasSession}, hasQR=${!!qrCode}`);
+    
+    res.json({
+        connected: isReallyConnected,
+        hasSession: hasSession,
+        qrAvailable: !!qrCode,
+        status: connectionStatus,
+        lastConnection: lastConnectionTime,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Força reset REAL da sessão (deleta tudo e reinicia)
+app.post('/force-reset', async (req, res) => {
+    try {
+        log('=== FORCE RESET INICIADO ===');
+        
+        if (sock) {
+            try {
+                log('Encerrando socket existente...');
+                sock.end();
+            } catch (e) {
+                log('Erro ao encerrar socket:', e.message);
+            }
+            sock = null;
+        }
+        
+        connectionStatus = 'disconnected';
+        qrCode = null;
+        qrDataUrl = null;
+        reconnectAttempts = 0;
+        
+        log('Deletando pasta de autenticação...');
+        try {
+            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+        } catch (e) {
+            log('Erro ao deletar pasta:', e.message);
+        }
+        
+        log('Recriando pasta de autenticação...');
+        fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+        
+        await new Promise(r => setTimeout(r, 1000));
+        
+        log('Reiniciando conexão WhatsApp...');
+        connectWhatsApp();
+        
+        log('=== FORCE RESET CONCLUÍDO - QR será gerado ===');
+        
+        res.json({ 
+            success: true, 
+            ok: true,
+            status: 'session reset, QR will be regenerated',
+            message: 'Sessão resetada. QR Code será gerado em segundos.'
+        });
+    } catch (error) {
+        log('Erro no force-reset:', error.message);
         res.status(500).json({ success: false, ok: false, error: error.message });
+    }
+});
+
+// Endpoint /connect - (re)inicializa o socket para gerar QR
+app.get('/connect', async (req, res) => {
+    try {
+        log('=== CONNECT ENDPOINT CHAMADO ===');
+        
+        if (connectionStatus === 'connected' && sock) {
+            log('Já conectado, retornando status atual');
+            return res.json({
+                success: true,
+                status: 'already_connected',
+                connected: true,
+                message: 'WhatsApp já está conectado'
+            });
+        }
+        
+        if (qrCode) {
+            log('QR já disponível');
+            return res.json({
+                success: true,
+                status: 'qr_available',
+                hasQR: true,
+                message: 'QR Code já disponível'
+            });
+        }
+        
+        if (!sock) {
+            log('Socket não existe, iniciando conexão...');
+            connectWhatsApp();
+            
+            await new Promise(r => setTimeout(r, 2000));
+        }
+        
+        res.json({
+            success: true,
+            status: 'connecting',
+            message: 'Conexão iniciada. Aguarde o QR Code...'
+        });
+    } catch (error) {
+        log('Erro no /connect:', error.message);
+        res.status(500).json({ success: false, ok: false, error: error.message });
+    }
+});
+
+// QR Code como imagem PNG
+app.get('/qr.png', async (req, res) => {
+    try {
+        if (!qrCode) {
+            return res.status(404).send('QR Code não disponível');
+        }
+        
+        const buffer = await QRCode.toBuffer(qrCode, { type: 'png', width: 400 });
+        res.type('image/png').send(buffer);
+    } catch (error) {
+        res.status(500).send('Erro ao gerar imagem do QR');
     }
 });
 
@@ -759,7 +894,7 @@ app.post('/logout', async (req, res) => {
 
 app.listen(PORT, () => {
     log(`===========================================`);
-    log(`  VOXYAI WHATSAPP SERVER v4.0 ALWAYS-ON`);
+    log(`  VOXYAI WHATSAPP SERVER v4.1 ALWAYS-ON`);
     log(`===========================================`);
     log(`Porta: ${PORT}`);
     log(`URL: ${SELF_URL}`);
@@ -768,17 +903,11 @@ app.listen(PORT, () => {
     log(`Mídia: ${MEDIA_FOLDER}`);
     log(`===========================================`);
 
-    // Inicia conexão WhatsApp
     connectWhatsApp();
-
-    // Inicia keep-alive
     startKeepAlive();
-
-    // Limpeza inicial de mídia antiga
     cleanOldMedia();
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
     log('Recebido SIGTERM, encerrando...');
     if (sock) {
