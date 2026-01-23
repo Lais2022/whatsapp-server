@@ -1,19 +1,17 @@
-{
-  "name": "whatsapp-server",
-  "version": "4.2.0",
-  "main": "servidor.js",
-  "scripts": {
-    "start": "node servidor.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.2",
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "pino": "^9.6.0",
-    "qrcode": "^1.5.3"
-  }
-}
+# ============================================
+# RENDER.YAML - Deploy Automático
+# ============================================
+
+services:
+  - type: web
+    name: whatsapp-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SELF_URL
+        sync: false
