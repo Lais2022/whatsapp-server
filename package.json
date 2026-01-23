@@ -1,30 +1,19 @@
 {
-  "name": "voxyai-whatsapp-server",
-  "version": "4.0.0",
-  "description": "Servidor WhatsApp Always-On para VoxyAI CRM",
+  "name": "whatsapp-server",
+  "version": "4.2.0",
   "main": "servidor.js",
   "scripts": {
-    "start": "node servidor.js",
-    "dev": "node servidor.js"
+    "start": "node servidor.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "cors": "^2.8.5",
-    "@whiskeysockets/baileys": "^6.7.16",
     "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
     "pino": "^9.6.0",
-    "qrcode": "^1.5.4",
-    "mime-types": "^2.1.35"
-  },
-  "keywords": [
-    "whatsapp",
-    "baileys",
-    "crm",
-    "voxyai"
-  ],
-  "author": "VoxyAI",
-  "license": "MIT"
+    "qrcode": "^1.5.3"
+  }
 }
