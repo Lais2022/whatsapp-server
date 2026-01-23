@@ -1,20 +1,19 @@
-# ==============================================
-# RENDER.YAML - Deploy Automático Render Free
-# Cole este arquivo no seu repositório GitHub
-# ==============================================
-
-services:
-  - type: web
-    name: whatsapp-server
-    runtime: docker
-    # IMPORTANTE: aponta pro diretório do backend
-    dockerContext: standalone-project/backend
-    dockerfilePath: standalone-project/backend/Dockerfile
-    region: oregon
-    plan: free
-    healthCheckPath: /health
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: SELF_URL
-        sync: false  # Preencha manualmente após o deploy com a URL do Render
+{
+  "name": "whatsapp-server",
+  "version": "4.2.0",
+  "main": "servidor.js",
+  "scripts": {
+    "start": "node servidor.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.3"
+  }
+}
