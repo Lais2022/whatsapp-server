@@ -1,21 +1,18 @@
-# 🚀 WhatsApp Server v4.3.0 - VoxyAI CRM
+# WhatsApp Server v4.5.0
 
-Servidor WhatsApp otimizado para **Render Free Tier**.
+## Deploy no Render
 
-## 📁 Arquivos
+1. Crie um repositório GitHub com estes 6 arquivos
+2. No Render, crie um Web Service → Docker
+3. Conecte seu repositório
+4. Deixe "Root Directory" VAZIO
+5. Após deploy, copie a URL e configure em SELF_URL
+6. Acesse /connect para escanear o QR Code
 
-| Arquivo | Descrição |
-|---------|-----------|
-| `servidor.js` | Código principal do servidor |
-| `package.json` | Dependências do projeto |
-| `Dockerfile` | Configuração Docker para Render |
-| `render.yaml` | Deploy automático no Render |
-| `.env.example` | Exemplo de variáveis de ambiente |
+## Endpoints
 
-## 🔧 Deploy no Render
-
-### 1. Subir para GitHub
-```bash
-git add .
-git commit -m "WhatsApp Server v4.3.0"
-git push
+- GET /health - Status do servidor
+- GET /connect - Página para escanear QR
+- GET /status - Status completo
+- POST /send - Enviar mensagem
+- POST /force-reset - Resetar sessão
