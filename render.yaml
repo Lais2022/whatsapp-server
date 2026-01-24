@@ -2,12 +2,12 @@ services:
   - type: web
     name: whatsapp-server
     runtime: docker
-    dockerfilePath: ./Dockerfile
-    region: oregon
     plan: free
     healthCheckPath: /health
     envVars:
-      - key: NODE_ENV
-        value: production
+      - key: PORT
+        value: "10000"
       - key: SELF_URL
-        sync: false
+        value: https://whatsapp-server-z7pm.onrender.com
+      - key: DATA_FOLDER
+        value: /var/data
