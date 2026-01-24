@@ -1,23 +1,17 @@
 {
   "name": "whatsapp-server",
-  "version": "4.3.0",
-  "description": "WhatsApp Server para VoxyAI CRM - Otimizado para Render Free",
+  "version": "4.5.0",
+  "type": "commonjs",
   "main": "servidor.js",
   "scripts": {
     "start": "node servidor.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.2",
+    "@whiskeysockets/baileys": "^6.7.16",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "pino": "^9.6.0",
-    "qrcode": "^1.5.3"
-  },
-  "keywords": ["whatsapp", "baileys", "crm", "automation"],
-  "author": "VoxyAI",
-  "license": "MIT"
+    "qrcode": "^1.5.4"
+  }
 }
