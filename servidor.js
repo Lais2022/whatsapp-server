@@ -1,777 +1,582 @@
 // ============================================
-// WHATSAPP SERVER v4.3.0 - VoxyAI CRM
-// Otimizado para Render Free Tier
+// SERVIDOR WHATSAPP v4.5.0 - MUTEX ABSOLUTO
 // ============================================
 
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const pino = require('pino');
 const express = require('express');
 const cors = require('cors');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
-const QRCode = require('qrcode');
-const pino = require('pino');
+const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-const app = express();
+const SERVER_VERSION = '4.5.0';
 
-// ============================================
-// CONFIGURAÇÃO
-// ============================================
+const app = express();
 const PORT = process.env.PORT || 3000;
-const SELF_URL = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL;
+const SELF_URL = process.env.SELF_URL || '';
 const DATA_FOLDER = process.env.DATA_FOLDER || './data';
 const AUTH_FOLDER = path.join(DATA_FOLDER, 'auth_info');
 const KEEPALIVE_INTERVAL = parseInt(process.env.KEEPALIVE_INTERVAL) || 240000;
 
-// Criar pastas necessárias
-if (!fs.existsSync(DATA_FOLDER)) fs.mkdirSync(DATA_FOLDER, { recursive: true });
-if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
-// ============================================
-// ESTADO GLOBAL
-// ============================================
 let sock = null;
-let qrCode = null;
-let qrDataUrl = null;
-let connectionStatus = 'disconnected';
-let isConnected = false;
-let isAuthenticated = false;
-let isReady = false;
-let lastError = null;
-let messages = [];
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
-const startTime = Date.now();
+let qrCodeData = null;
+let qrAttempts = 0;
+const MAX_QR_ATTEMPTS = 5;
 
-// ============================================
-// MIDDLEWARES
-// ============================================
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+let connectionMutex = null;
+let pendingReconnect = null;
 
-// ============================================
-// HELPERS
-// ============================================
-function log(msg, data = null) {
+let state = {
+  isConnected: false,
+  isReady: false,
+  isAuthenticated: false,
+  hasSession: false,
+  qrAvailable: false,
+  status: 'disconnected',
+  lastConnection: null,
+  reconnectAttempts: 0,
+  isConnecting: false,
+  messagesCount: 0,
+  lastError: null,
+  sessionInfo: null
+};
+
+const messages = [];
+const MAX_MESSAGES = 200;
+
+const log = (msg, data = null) => {
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${msg}`, data ? JSON.stringify(data) : '');
-}
-
-function formatPhone(phone) {
-  if (!phone) return null;
-  let cleaned = phone.toString().replace(/\D/g, '');
-  if (cleaned.length === 11 && cleaned.startsWith('9')) {
-    cleaned = '55' + cleaned;
-  } else if (cleaned.length === 10 || cleaned.length === 11) {
-    cleaned = '55' + cleaned;
+  if (data) {
+    console.log(`[${timestamp}] ${msg}`, typeof data === 'object' ? JSON.stringify(data) : data);
+  } else {
+    console.log(`[${timestamp}] ${msg}`);
   }
+};
+
+const formatPhone = (phone) => {
+  let cleaned = phone.replace(/\D/g, '');
+  if (cleaned.startsWith('0')) cleaned = '55' + cleaned.substring(1);
+  if (!cleaned.startsWith('55') && cleaned.length <= 11) cleaned = '55' + cleaned;
   return cleaned;
+};
+
+const checkSession = () => {
+  try {
+    const files = fs.readdirSync(AUTH_FOLDER).filter(f => f.endsWith('.json'));
+    return files.length > 0;
+  } catch { return false; }
+};
+
+const updateState = (updates) => {
+  const prev = { ...state };
+  state = { ...state, ...updates };
+  if (prev.status !== state.status) {
+    log(`📊 Status: ${prev.status} → ${state.status}`);
+  }
+};
+
+const startKeepAlive = () => {
+  if (!SELF_URL) {
+    log('⚠️ SELF_URL não configurado - keep-alive desativado');
+    return;
+  }
+  log(`✅ Keep-alive configurado: ${KEEPALIVE_INTERVAL}ms para ${SELF_URL}`);
+  setInterval(async () => {
+    try {
+      const res = await fetch(`${SELF_URL}/health`);
+      log(`🏓 Keep-alive ping ${res.ok ? 'OK' : 'FAIL'}`);
+    } catch (err) {
+      log('❌ Keep-alive falhou:', err.message);
+    }
+  }, KEEPALIVE_INTERVAL);
+};
+
+function scheduleReconnect(delay, reason) {
+  if (pendingReconnect) {
+    clearTimeout(pendingReconnect);
+    pendingReconnect = null;
+  }
+  log(`⏰ Reconectando em ${delay}ms (${reason})`);
+  pendingReconnect = setTimeout(() => {
+    pendingReconnect = null;
+    connectWhatsApp();
+  }, delay);
 }
 
-function checkSession() {
-  try {
-    const credsPath = path.join(AUTH_FOLDER, 'creds.json');
-    return fs.existsSync(credsPath);
-  } catch {
-    return false;
+function cancelPendingReconnect() {
+  if (pendingReconnect) {
+    clearTimeout(pendingReconnect);
+    pendingReconnect = null;
+    log('🚫 Reconexão pendente cancelada');
   }
 }
 
-function updateState(updates) {
-  Object.assign({ connectionStatus, isConnected, isAuthenticated, isReady, lastError }, updates);
-  if (updates.connectionStatus !== undefined) connectionStatus = updates.connectionStatus;
-  if (updates.isConnected !== undefined) isConnected = updates.isConnected;
-  if (updates.isAuthenticated !== undefined) isAuthenticated = updates.isAuthenticated;
-  if (updates.isReady !== undefined) isReady = updates.isReady;
-  if (updates.lastError !== undefined) lastError = updates.lastError;
-}
+async function connectWhatsApp(options = {}) {
+  const { force = false, source = 'auto' } = options;
+  
+  if (connectionMutex) {
+    if (!force) {
+      log(`🔒 [${source}] Conexão bloqueada - mutex ativo`);
+      return connectionMutex;
+    }
+    log(`⚡ [${source}] Força passagem do mutex`);
+  }
+  
+  let resolveMutex;
+  connectionMutex = new Promise(resolve => { resolveMutex = resolve; });
+  
+  log(`🔄 [${source}] Iniciando conexão WhatsApp...`);
+  updateState({ isConnecting: true, status: 'connecting', lastError: null });
+  
+  const hasSession = checkSession();
+  updateState({ hasSession });
 
-// ============================================
-// KEEP-ALIVE (Render Free)
-// ============================================
-if (SELF_URL) {
-  setInterval(() => {
-    fetch(`${SELF_URL}/health`)
-      .then(() => log('Keep-alive ping OK'))
-      .catch(err => log('Keep-alive ping failed', err.message));
-  }, KEEPALIVE_INTERVAL);
-  log(`Keep-alive configurado: ${KEEPALIVE_INTERVAL}ms para ${SELF_URL}`);
-}
-
-// ============================================
-// CONEXÃO WHATSAPP
-// ============================================
-async function connectWhatsApp() {
   try {
-    log('Iniciando conexão WhatsApp...');
+    if (sock) {
+      log('🔌 Fechando socket anterior...');
+      try {
+        sock.ev.removeAllListeners();
+        sock.end();
+      } catch (e) {}
+      sock = null;
+    }
     
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
     const { version } = await fetchLatestBaileysVersion();
     
+    log(`📱 Baileys v${version.join('.')}`);
+
     sock = makeWASocket({
       version,
-      auth: state,
-      printQRInTerminal: true,
       logger: pino({ level: 'silent' }),
-      browser: ['VoxyAI CRM', 'Chrome', '120.0.0'],
+      printQRInTerminal: false,
+      auth: authState,
+      browser: ['VoxyAI CRM', 'Chrome', '120'],
       connectTimeoutMs: 60000,
-      qrTimeout: 60000,
-      defaultQueryTimeoutMs: 60000,
+      shouldIgnoreJid: jid => isJidBroadcast(jid),
+      markOnlineOnConnect: true,
+      retryRequestDelayMs: 500,
     });
 
-    // Salvar credenciais
     sock.ev.on('creds.update', saveCreds);
 
-    // Atualização de conexão
     sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, receivedPendingNotifications } = update;
       
-      log('Connection update:', { connection, hasQR: !!qr });
+      log('📡 Connection update:', { connection, hasQR: !!qr });
 
-      if (qr) {
-        qrCode = qr;
-        qrDataUrl = await QRCode.toDataURL(qr);
-        updateState({
-          connectionStatus: 'waiting_qr',
-          isConnected: false,
-          isAuthenticated: false,
-          isReady: false
-        });
-        log('QR Code gerado');
+      if (qr && !state.isConnected && qrAttempts < MAX_QR_ATTEMPTS) {
+        qrCodeData = await qrcode.toDataURL(qr);
+        qrAttempts++;
+        log('📲 QR Code gerado');
+        updateState({ qrAvailable: true, status: 'waiting_qr' });
+        resolveMutex?.();
+        connectionMutex = null;
       }
 
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const boom = new Boom(lastDisconnect?.error);
+        const statusCode = boom?.output?.statusCode;
         const reason = DisconnectReason[statusCode] || statusCode;
         
-        log('Conexão fechada:', { statusCode, reason });
+        log(`❌ Conexão fechada: ${JSON.stringify({statusCode, reason})}`);
         
-        updateState({
-          connectionStatus: 'disconnected',
-          isConnected: false,
-          isReady: false
+        resolveMutex?.();
+        connectionMutex = null;
+        
+        updateState({ 
+          isConnected: false, 
+          isReady: false,
+          isAuthenticated: false,
+          isConnecting: false,
+          qrAvailable: false,
+          status: 'disconnected'
         });
+
+        if (statusCode === 440) {
+          log('⚠️ connectionReplaced (440) - NÃO reconectando automaticamente');
+          updateState({ lastError: 'Outra sessão assumiu. Use /force-reset.' });
+          return;
+        }
+
+        if (statusCode === DisconnectReason.loggedOut || 
+            statusCode === DisconnectReason.badSession ||
+            statusCode === 401) {
+          log('🗑️ Sessão inválida - limpando...');
+          fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+          fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+          qrCodeData = null;
+          qrAttempts = 0;
+          updateState({ hasSession: false, sessionInfo: null });
+          scheduleReconnect(2000, 'session_invalid');
+          return;
+        }
         
-        qrCode = null;
-        qrDataUrl = null;
-
-        // Limpar sessão se logout ou não autorizado
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-          log('Sessão expirada, limpando...');
-          try {
-            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-            fs.mkdirSync(AUTH_FOLDER, { recursive: true });
-          } catch (e) {
-            log('Erro ao limpar sessão:', e.message);
-          }
-          reconnectAttempts = 0;
-        }
-
-        // Reconectar
-        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          reconnectAttempts++;
-          const delay = Math.min(5000 * reconnectAttempts, 30000);
-          log(`Reconectando em ${delay}ms (tentativa ${reconnectAttempts})`);
-          setTimeout(connectWhatsApp, delay);
-        } else {
-          log('Máximo de tentativas atingido');
-          updateState({ lastError: 'Máximo de tentativas de reconexão atingido' });
-        }
+        const attempt = state.reconnectAttempts + 1;
+        const delay = Math.min(5000 * attempt, 30000);
+        updateState({ reconnectAttempts: attempt });
+        scheduleReconnect(delay, `tentativa ${attempt}`);
       }
 
       if (connection === 'open') {
-        log('Conexão estabelecida!');
-        reconnectAttempts = 0;
-        qrCode = null;
-        qrDataUrl = null;
+        log('✅ Conexão estabelecida!');
+        
+        resolveMutex?.();
+        connectionMutex = null;
+        
+        qrCodeData = null;
+        qrAttempts = 0;
         updateState({
-          connectionStatus: 'connected',
           isConnected: true,
           isAuthenticated: true,
+          isConnecting: false,
+          qrAvailable: false,
+          hasSession: true,
+          status: 'authenticated',
+          lastConnection: new Date().toISOString(),
+          reconnectAttempts: 0,
           lastError: null
         });
+        
+        if (sock?.user) {
+          updateState({ sessionInfo: { id: sock.user.id, name: sock.user.name || 'User' } });
+        }
+        
+        setTimeout(() => {
+          if (state.isConnected && !state.isReady) {
+            log('✅ Timeout - marcando como READY');
+            updateState({ isReady: true, status: 'ready' });
+          }
+        }, 3000);
+      }
+
+      if (receivedPendingNotifications === true && state.isConnected) {
+        log('✅ Primeira mensagem recebida - sessão READY');
+        updateState({ isReady: true, status: 'ready' });
       }
     });
 
-    // Mensagens recebidas - marca como READY
-    sock.ev.on('messages.upsert', async ({ messages: newMessages, type }) => {
-      // Primeira mensagem = sessão está pronta
-      if (!isReady && isConnected) {
-        log('Primeira mensagem recebida - sessão READY');
-        updateState({ isReady: true });
-      }
-
-      if (type === 'notify') {
-        for (const msg of newMessages) {
-          if (!msg.key.fromMe && msg.message) {
-            const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '');
-            const text = msg.message?.conversation || 
-                        msg.message?.extendedTextMessage?.text || 
-                        '[mídia]';
-            
-            log('Mensagem recebida:', { phone, text: text.substring(0, 50) });
-            
-            messages.unshift({
-              id: msg.key.id,
-              phone,
-              text,
-              timestamp: Date.now(),
-              fromMe: false,
-              type: 'text'
-            });
-            
-            if (messages.length > 200) messages = messages.slice(0, 200);
-          }
+    sock.ev.on('messages.upsert', ({ messages: msgs, type }) => {
+      for (const msg of msgs) {
+        try {
+          if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
+          if (msg.key.remoteJid?.includes('@g.us')) continue;
+          
+          const text = msg.message.conversation || 
+                       msg.message.extendedTextMessage?.text || 
+                       msg.message.imageMessage?.caption || '';
+          
+          const newMessage = {
+            id: msg.key.id,
+            from: msg.key.remoteJid,
+            fromMe: msg.key.fromMe,
+            text,
+            type: Object.keys(msg.message)[0],
+            timestamp: Date.now(),
+            pushName: msg.pushName || 'Desconhecido',
+            hasMedia: !!msg.message.imageMessage || !!msg.message.videoMessage || 
+                     !!msg.message.audioMessage || !!msg.message.documentMessage
+          };
+          
+          messages.unshift(newMessage);
+          if (messages.length > MAX_MESSAGES) messages.pop();
+          
+          log(`📩 ${newMessage.fromMe ? 'ENVIADA' : 'RECEBIDA'}: ${text.substring(0, 50)}`);
+        } catch (err) {
+          log('❌ Erro ao processar mensagem:', err.message);
         }
       }
     });
 
-    // Timeout para marcar ready se não receber mensagens
-    setTimeout(() => {
-      if (isConnected && !isReady) {
-        log('Timeout - marcando como READY');
-        updateState({ isReady: true });
-      }
-    }, 10000);
-
-  } catch (error) {
-    log('Erro na conexão:', error.message);
-    updateState({ lastError: error.message });
-    
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++;
-      setTimeout(connectWhatsApp, 5000);
-    }
+  } catch (err) {
+    log('❌ Erro na conexão:', err.message);
+    resolveMutex?.();
+    connectionMutex = null;
+    updateState({ 
+      isConnecting: false, 
+      status: 'error',
+      lastError: err.message,
+      isReady: false
+    });
+    scheduleReconnect(5000, 'connection_error');
   }
 }
 
-// ============================================
-// ROTAS - STATUS
-// ============================================
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    version: '4.3.0',
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    timestamp: new Date().toISOString()
-  });
-});
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-app.get('/debug', (req, res) => {
-  res.json({
-    version: '4.3.0',
-    connectionStatus,
-    isConnected,
-    isAuthenticated,
-    isReady,
-    hasSession: checkSession(),
-    hasQR: !!qrCode,
-    messagesCount: messages.length,
-    reconnectAttempts,
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    lastError
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    version: SERVER_VERSION, 
+    timestamp: new Date().toISOString(),
+    whatsapp: { connected: state.isConnected, ready: state.isReady, status: state.status }
   });
 });
 
 app.get('/status', (req, res) => {
   res.json({
-    ok: true,
-    success: true,
-    version: '4.3.0',
-    status: connectionStatus,
-    isConnected,
-    isAuthenticated,
-    isReady,
-    hasSession: checkSession(),
-    hasQR: !!qrCode,
-    timestamp: Date.now()
+    ...state,
+    connected: state.isConnected,
+    ready: state.isReady,
+    hasQR: state.qrAvailable,
+    messagesCount: messages.length,
+    version: SERVER_VERSION,
+    uptime: process.uptime()
   });
 });
 
 app.get('/whatsapp-status', (req, res) => {
   res.json({
-    ok: true,
-    success: true,
-    version: '4.3.0',
-    connected: isConnected,
-    ready: isReady,
-    status: connectionStatus,
-    isConnected,
-    isAuthenticated,
-    isReady,
-    hasQR: !!qrCode,
-    qrCode: qrDataUrl,
-    timestamp: Date.now()
+    connected: state.isConnected,
+    isConnected: state.isConnected,
+    isReady: state.isReady,
+    isAuthenticated: state.isAuthenticated,
+    hasSession: state.hasSession,
+    qrAvailable: state.qrAvailable,
+    qrCode: qrCodeData,
+    status: state.status,
+    lastError: state.lastError,
+    sessionInfo: state.sessionInfo,
+    version: SERVER_VERSION
   });
 });
 
-// ============================================
-// ROTAS - QR CODE
-// ============================================
 app.get('/qr', (req, res) => {
-  if (isConnected) {
-    return res.json({
-      ok: true,
-      connected: true,
-      message: 'Já conectado'
-    });
-  }
-  
-  if (qrDataUrl) {
-    return res.json({
-      ok: true,
-      qr: qrDataUrl,
-      qrCode: qrDataUrl,
-      status: connectionStatus
-    });
-  }
-  
-  res.status(202).json({
-    ok: false,
-    message: 'QR Code ainda não disponível',
-    status: connectionStatus
+  res.json({
+    qr: qrCodeData,
+    qrCode: qrCodeData,
+    available: !!qrCodeData,
+    isConnected: state.isConnected,
+    isReady: state.isReady,
+    status: state.status
   });
 });
 
 app.get('/qr.png', async (req, res) => {
-  if (!qrCode) {
-    return res.status(404).send('QR não disponível');
-  }
-  
-  try {
-    const buffer = await QRCode.toBuffer(qrCode, { width: 300 });
-    res.setHeader('Content-Type', 'image/png');
-    res.send(buffer);
-  } catch (error) {
-    res.status(500).send('Erro ao gerar QR');
-  }
+  if (!qrCodeData) return res.status(202).send('QR não disponível');
+  const base64 = qrCodeData.split(',')[1];
+  const buffer = Buffer.from(base64, 'base64');
+  res.set('Content-Type', 'image/png');
+  res.send(buffer);
 });
 
-// ============================================
-// ROTAS - MENSAGENS
-// ============================================
-app.get('/messages', (req, res) => {
-  res.json({
-    ok: true,
-    success: true,
-    messages,
-    count: messages.length
-  });
-});
-
-app.post('/send', async (req, res) => {
-  const phone = req.body.phone || req.body.to;
-  const message = req.body.message || req.body.text;
-  
-  if (!phone || !message) {
-    return res.status(400).json({
-      ok: false,
-      success: false,
-      error: 'phone e message são obrigatórios'
-    });
-  }
-  
-  if (!isConnected || !isReady) {
-    return res.status(503).json({
-      ok: false,
-      success: false,
-      error: 'WhatsApp não está pronto',
-      status: connectionStatus,
-      isConnected,
-      isReady
-    });
-  }
-  
-  try {
-    const formattedPhone = formatPhone(phone);
-    const jid = `${formattedPhone}@s.whatsapp.net`;
-    
-    await sock.sendMessage(jid, { text: message });
-    
-    messages.unshift({
-      id: `sent-${Date.now()}`,
-      phone: formattedPhone,
-      text: message,
-      timestamp: Date.now(),
-      fromMe: true,
-      type: 'text'
-    });
-    
-    log('Mensagem enviada:', { phone: formattedPhone });
-    
-    res.json({
-      ok: true,
-      success: true,
-      message: 'Mensagem enviada',
-      phone: formattedPhone
-    });
-  } catch (error) {
-    log('Erro ao enviar:', error.message);
-    res.status(500).json({
-      ok: false,
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ============================================
-// ROTAS - MÍDIA
-// ============================================
-app.post('/send-image', async (req, res) => {
-  const phone = req.body.phone || req.body.to;
-  const { image, caption } = req.body;
-  
-  if (!phone || !image) {
-    return res.status(400).json({ ok: false, error: 'phone e image obrigatórios' });
-  }
-  
-  if (!isConnected || !isReady) {
-    return res.status(503).json({ ok: false, error: 'WhatsApp não pronto' });
-  }
-  
-  try {
-    const formattedPhone = formatPhone(phone);
-    const jid = `${formattedPhone}@s.whatsapp.net`;
-    const imageBuffer = Buffer.from(image.replace(/^data:image\/\w+;base64,/, ''), 'base64');
-    
-    await sock.sendMessage(jid, {
-      image: imageBuffer,
-      caption: caption || ''
-    });
-    
-    log('Imagem enviada:', { phone: formattedPhone });
-    res.json({ ok: true, success: true, message: 'Imagem enviada' });
-  } catch (error) {
-    log('Erro ao enviar imagem:', error.message);
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post('/send-audio', async (req, res) => {
-  const phone = req.body.phone || req.body.to;
-  const { audio } = req.body;
-  
-  if (!phone || !audio) {
-    return res.status(400).json({ ok: false, error: 'phone e audio obrigatórios' });
-  }
-  
-  if (!isConnected || !isReady) {
-    return res.status(503).json({ ok: false, error: 'WhatsApp não pronto' });
-  }
-  
-  try {
-    const formattedPhone = formatPhone(phone);
-    const jid = `${formattedPhone}@s.whatsapp.net`;
-    const audioBuffer = Buffer.from(audio.replace(/^data:audio\/\w+;base64,/, ''), 'base64');
-    
-    await sock.sendMessage(jid, {
-      audio: audioBuffer,
-      mimetype: 'audio/ogg; codecs=opus',
-      ptt: true
-    });
-    
-    log('Áudio enviado:', { phone: formattedPhone });
-    res.json({ ok: true, success: true, message: 'Áudio enviado' });
-  } catch (error) {
-    log('Erro ao enviar áudio:', error.message);
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post('/send-document', async (req, res) => {
-  const phone = req.body.phone || req.body.to;
-  const { document, filename, mimetype } = req.body;
-  
-  if (!phone || !document) {
-    return res.status(400).json({ ok: false, error: 'phone e document obrigatórios' });
-  }
-  
-  if (!isConnected || !isReady) {
-    return res.status(503).json({ ok: false, error: 'WhatsApp não pronto' });
-  }
-  
-  try {
-    const formattedPhone = formatPhone(phone);
-    const jid = `${formattedPhone}@s.whatsapp.net`;
-    const docBuffer = Buffer.from(document.replace(/^data:[^;]+;base64,/, ''), 'base64');
-    
-    await sock.sendMessage(jid, {
-      document: docBuffer,
-      fileName: filename || 'documento',
-      mimetype: mimetype || 'application/octet-stream'
-    });
-    
-    log('Documento enviado:', { phone: formattedPhone, filename });
-    res.json({ ok: true, success: true, message: 'Documento enviado' });
-  } catch (error) {
-    log('Erro ao enviar documento:', error.message);
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-// ============================================
-// ROTAS - CONTROLE
-// ============================================
-app.post('/logout', async (req, res) => {
-  try {
-    if (sock) {
-      await sock.logout();
-      sock.end();
-    }
-    
-    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-    fs.mkdirSync(AUTH_FOLDER, { recursive: true });
-    
-    updateState({
-      connectionStatus: 'disconnected',
-      isConnected: false,
-      isAuthenticated: false,
-      isReady: false
-    });
-    
-    qrCode = null;
-    qrDataUrl = null;
-    
-    log('Logout realizado');
-    
-    setTimeout(connectWhatsApp, 2000);
-    
-    res.json({ ok: true, message: 'Desconectado' });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.post('/force-reset', async (req, res) => {
-  try {
-    log('Force reset iniciado...');
-    
-    if (sock) {
-      try {
-        sock.end();
-      } catch (e) {
-        log('Erro ao encerrar socket:', e.message);
-      }
-    }
-    
-    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-    fs.mkdirSync(AUTH_FOLDER, { recursive: true });
-    
-    updateState({
-      connectionStatus: 'disconnected',
-      isConnected: false,
-      isAuthenticated: false,
-      isReady: false,
-      lastError: null
-    });
-    
-    qrCode = null;
-    qrDataUrl = null;
-    reconnectAttempts = 0;
-    
-    setTimeout(connectWhatsApp, 1000);
-    
-    log('Force reset concluído');
-    res.json({ ok: true, message: 'Reset realizado, novo QR em breve' });
-  } catch (error) {
-    log('Erro no force-reset:', error.message);
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-// ============================================
-// PÁGINA DE CONEXÃO
-// ============================================
 app.get('/connect', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
-<html>
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsApp - VoxyAI</title>
+  <title>Conectar WhatsApp - v${SERVER_VERSION}</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .card {
-      background: white;
-      border-radius: 20px;
-      padding: 40px;
-      max-width: 420px;
-      width: 100%;
-      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
-      text-align: center;
-    }
-    h1 { color: #1a1a2e; margin-bottom: 10px; font-size: 24px; }
-    .version { color: #888; font-size: 12px; margin-bottom: 20px; }
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 16px;
-      border-radius: 20px;
-      font-size: 14px;
-      font-weight: 500;
-      margin-bottom: 20px;
-    }
-    .status.connected { background: #d4edda; color: #155724; }
-    .status.waiting { background: #fff3cd; color: #856404; }
-    .status.disconnected { background: #f8d7da; color: #721c24; }
-    .status.ready { background: #cce5ff; color: #004085; }
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      animation: pulse 1.5s infinite;
-    }
-    .connected .dot { background: #28a745; }
-    .waiting .dot { background: #ffc107; }
-    .disconnected .dot { background: #dc3545; }
-    .ready .dot { background: #007bff; }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
-    }
-    #qr-container {
-      background: #f8f9fa;
-      border-radius: 15px;
-      padding: 20px;
-      margin: 20px 0;
-    }
-    #qr-container img {
-      max-width: 250px;
-      width: 100%;
-      border-radius: 10px;
-    }
-    .info { color: #666; font-size: 14px; margin: 15px 0; }
-    .buttons { display: flex; gap: 10px; justify-content: center; margin-top: 20px; }
-    button {
-      padding: 12px 24px;
-      border: none;
-      border-radius: 10px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    .btn-primary { background: #667eea; color: white; }
-    .btn-primary:hover { background: #5a6fd6; }
-    .btn-danger { background: #dc3545; color: white; }
-    .btn-danger:hover { background: #c82333; }
-    .debug { margin-top: 20px; font-size: 11px; color: #999; text-align: left; background: #f5f5f5; padding: 10px; border-radius: 8px; }
+    body { font-family: -apple-system, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { background: white; border-radius: 20px; padding: 40px; text-align: center; box-shadow: 0 25px 50px rgba(0,0,0,0.25); max-width: 450px; width: 90%; }
+    h1 { color: #25d366; margin-bottom: 10px; }
+    .version { color: #999; font-size: 12px; margin-bottom: 20px; }
+    #qr { margin: 20px 0; min-height: 256px; display: flex; align-items: center; justify-content: center; }
+    #qr img { border-radius: 10px; max-width: 256px; }
+    .status { padding: 12px 24px; border-radius: 30px; font-weight: 600; margin-top: 20px; display: inline-block; }
+    .ready { background: #dcfce7; color: #16a34a; }
+    .waiting { background: #fef3c7; color: #d97706; }
+    .error { background: #fee2e2; color: #dc2626; }
+    .spinner { width: 50px; height: 50px; border: 4px solid #f3f3f3; border-top: 4px solid #667eea; border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .btn { background: #667eea; color: white; border: none; padding: 12px 30px; border-radius: 30px; cursor: pointer; font-size: 16px; margin-top: 15px; }
+    .btn:hover { background: #5a67d8; }
+    .btn-danger { background: #dc2626; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>🟢 WhatsApp VoxyAI</h1>
-    <div class="version">Servidor v4.3.0</div>
-    
-    <div id="status" class="status disconnected">
-      <span class="dot"></span>
-      <span id="status-text">Verificando...</span>
-    </div>
-    
-    <div id="qr-container">
-      <div id="qr-content">Carregando...</div>
-    </div>
-    
-    <p class="info">Escaneie o QR Code com seu WhatsApp</p>
-    
-    <div class="buttons">
-      <button class="btn-primary" onclick="refresh()">🔄 Atualizar</button>
-      <button class="btn-danger" onclick="reset()">⚠️ Reset</button>
-    </div>
-    
-    <div class="debug" id="debug"></div>
+    <h1>📱 WhatsApp</h1>
+    <p class="version">VoxyAI CRM - v${SERVER_VERSION}</p>
+    <div id="qr"><div class="spinner"></div></div>
+    <div id="status" class="status waiting">Carregando...</div>
+    <div id="actions"></div>
   </div>
-
   <script>
-    async function checkStatus() {
+    async function check() {
       try {
-        const res = await fetch('/whatsapp-status');
-        const data = await res.json();
-        
+        const r = await fetch('/whatsapp-status');
+        const d = await r.json();
+        const qrEl = document.getElementById('qr');
         const statusEl = document.getElementById('status');
-        const statusText = document.getElementById('status-text');
-        const qrContent = document.getElementById('qr-content');
-        const debug = document.getElementById('debug');
+        const actionsEl = document.getElementById('actions');
         
-        debug.innerHTML = 'isConnected: ' + data.isConnected + '<br>' +
-                         'isReady: ' + data.isReady + '<br>' +
-                         'status: ' + data.status + '<br>' +
-                         'hasQR: ' + data.hasQR;
-        
-        if (data.isReady) {
+        if (d.isReady) {
+          qrEl.innerHTML = '<div style="font-size:80px">✅</div>';
           statusEl.className = 'status ready';
-          statusText.textContent = '✅ PRONTO';
-          qrContent.innerHTML = '<div style="font-size:48px">✅</div><p>WhatsApp conectado e pronto!</p>';
-        } else if (data.isConnected) {
-          statusEl.className = 'status connected';
-          statusText.textContent = 'Conectado (aguardando ready)';
-          qrContent.innerHTML = '<div style="font-size:48px">⏳</div><p>Sincronizando...</p>';
-        } else if (data.qrCode) {
+          statusEl.textContent = 'PRONTO!';
+          actionsEl.innerHTML = '<button class="btn btn-danger" onclick="reset()">Desconectar</button>';
+        } else if (d.qrCode) {
+          qrEl.innerHTML = '<img src="' + d.qrCode + '" alt="QR">';
           statusEl.className = 'status waiting';
-          statusText.textContent = 'Aguardando scan';
-          qrContent.innerHTML = '<img src="' + data.qrCode + '" alt="QR Code">';
+          statusEl.textContent = 'Escaneie o QR Code';
+          actionsEl.innerHTML = '';
+        } else if (d.lastError) {
+          qrEl.innerHTML = '<div style="font-size:60px">⚠️</div>';
+          statusEl.className = 'status error';
+          statusEl.textContent = d.lastError;
+          actionsEl.innerHTML = '<button class="btn" onclick="reset()">Gerar Novo QR</button>';
         } else {
-          statusEl.className = 'status disconnected';
-          statusText.textContent = 'Gerando QR...';
-          qrContent.innerHTML = '<div style="font-size:48px">⏳</div><p>Aguarde...</p>';
+          qrEl.innerHTML = '<div class="spinner"></div>';
+          statusEl.className = 'status waiting';
+          statusEl.textContent = 'Gerando QR...';
+          actionsEl.innerHTML = '<button class="btn" onclick="reset()">Forçar</button>';
         }
-      } catch (e) {
-        document.getElementById('status-text').textContent = 'Erro: ' + e.message;
+      } catch(e) {
+        document.getElementById('status').textContent = 'Erro';
       }
     }
-    
-    async function refresh() {
-      await checkStatus();
-    }
-    
     async function reset() {
-      if (confirm('Resetar sessão e gerar novo QR?')) {
-        await fetch('/force-reset', { method: 'POST' });
-        setTimeout(checkStatus, 2000);
-      }
+      await fetch('/force-reset', {method:'POST'});
+      setTimeout(check, 2000);
     }
-    
-    checkStatus();
-    setInterval(checkStatus, 3000);
+    check();
+    setInterval(check, 3000);
   </script>
 </body>
-</html>
-  `);
+</html>`);
 });
 
-// ============================================
-// INICIAR SERVIDOR
-// ============================================
+app.post('/send', async (req, res) => {
+  const phone = req.body.to || req.body.phone;
+  const text = req.body.message || req.body.text;
+  
+  if (!phone || !text) return res.status(400).json({ ok: false, error: 'phone e message obrigatórios' });
+  if (!state.isReady || !sock) return res.status(503).json({ ok: false, error: 'WhatsApp não está pronto' });
+  
+  try {
+    const jid = formatPhone(phone) + '@s.whatsapp.net';
+    const result = await sock.sendMessage(jid, { text });
+    log(`✅ Mensagem enviada: ${JSON.stringify({phone})}`);
+    res.json({ ok: true, success: true, messageId: result?.key?.id });
+  } catch (err) {
+    log('❌ Erro:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/send-image', async (req, res) => {
+  const phone = req.body.to || req.body.phone;
+  const imageData = req.body.url || req.body.image;
+  const caption = req.body.caption || '';
+  
+  if (!phone || !imageData) return res.status(400).json({ ok: false, error: 'phone e image obrigatórios' });
+  if (!state.isReady || !sock) return res.status(503).json({ ok: false, error: 'WhatsApp não está pronto' });
+  
+  try {
+    const jid = formatPhone(phone) + '@s.whatsapp.net';
+    let imagePayload = imageData.startsWith('http') ? { url: imageData } : Buffer.from(imageData, 'base64');
+    const result = await sock.sendMessage(jid, { image: imagePayload, caption });
+    log(`✅ Imagem enviada: ${JSON.stringify({phone})}`);
+    res.json({ ok: true, success: true, messageId: result?.key?.id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/send-audio', async (req, res) => {
+  const phone = req.body.to || req.body.phone;
+  const audioData = req.body.url || req.body.audio;
+  const ptt = req.body.ptt !== false;
+  
+  if (!phone || !audioData) return res.status(400).json({ ok: false, error: 'phone e audio obrigatórios' });
+  if (!state.isReady || !sock) return res.status(503).json({ ok: false, error: 'WhatsApp não está pronto' });
+  
+  try {
+    const jid = formatPhone(phone) + '@s.whatsapp.net';
+    let audioPayload = audioData.startsWith('http') ? { url: audioData } : Buffer.from(audioData, 'base64');
+    const result = await sock.sendMessage(jid, { audio: audioPayload, mimetype: 'audio/ogg; codecs=opus', ptt });
+    log(`✅ Áudio enviado: ${JSON.stringify({phone})}`);
+    res.json({ ok: true, success: true, messageId: result?.key?.id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/send-video', async (req, res) => {
+  const phone = req.body.to || req.body.phone;
+  const videoData = req.body.url || req.body.video;
+  const caption = req.body.caption || '';
+  
+  if (!phone || !videoData) return res.status(400).json({ ok: false, error: 'phone e video obrigatórios' });
+  if (!state.isReady || !sock) return res.status(503).json({ ok: false, error: 'WhatsApp não está pronto' });
+  
+  try {
+    const jid = formatPhone(phone) + '@s.whatsapp.net';
+    let videoPayload = videoData.startsWith('http') ? { url: videoData } : Buffer.from(videoData, 'base64');
+    const result = await sock.sendMessage(jid, { video: videoPayload, caption });
+    res.json({ ok: true, success: true, messageId: result?.key?.id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/send-document', async (req, res) => {
+  const phone = req.body.to || req.body.phone;
+  const docData = req.body.url || req.body.document;
+  const filename = req.body.filename || 'documento';
+  
+  if (!phone || !docData) return res.status(400).json({ ok: false, error: 'phone e document obrigatórios' });
+  if (!state.isReady || !sock) return res.status(503).json({ ok: false, error: 'WhatsApp não está pronto' });
+  
+  try {
+    const jid = formatPhone(phone) + '@s.whatsapp.net';
+    let docPayload = docData.startsWith('http') ? { url: docData } : Buffer.from(docData, 'base64');
+    const result = await sock.sendMessage(jid, { document: docPayload, fileName: filename, mimetype: 'application/octet-stream' });
+    res.json({ ok: true, success: true, messageId: result?.key?.id });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/messages', (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  res.json({ ok: true, messages: messages.slice(0, limit), count: messages.length, isReady: state.isReady });
+});
+
+app.post('/logout', async (req, res) => {
+  log('👋 Logout');
+  cancelPendingReconnect();
+  try { if (sock) { await sock.logout(); sock.ev.removeAllListeners(); sock = null; } } catch {}
+  fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+  fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+  qrCodeData = null; qrAttempts = 0; connectionMutex = null;
+  updateState({ isConnected: false, isReady: false, isAuthenticated: false, hasSession: false, qrAvailable: false, status: 'disconnected', isConnecting: false, sessionInfo: null, lastError: null, reconnectAttempts: 0 });
+  setTimeout(() => connectWhatsApp({ source: 'logout' }), 1500);
+  res.json({ ok: true, status: 'logged out' });
+});
+
+app.post('/force-reset', async (req, res) => {
+  log('🔄 Force reset');
+  cancelPendingReconnect();
+  try { if (sock) { sock.ev.removeAllListeners(); sock.end(); sock = null; } } catch {}
+  fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+  fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+  qrCodeData = null; qrAttempts = 0; connectionMutex = null;
+  updateState({ isConnected: false, isReady: false, isAuthenticated: false, hasSession: false, qrAvailable: false, status: 'disconnected', isConnecting: false, reconnectAttempts: 0, sessionInfo: null, lastError: null });
+  setTimeout(() => connectWhatsApp({ force: true, source: 'force-reset' }), 1000);
+  res.json({ ok: true, status: 'reset' });
+});
+
+app.get('/debug', (req, res) => {
+  res.json({ state, messagesCount: messages.length, hasSocket: !!sock, hasMutex: !!connectionMutex, version: SERVER_VERSION });
+});
+
 app.listen(PORT, () => {
-  log(`Servidor WhatsApp v4.3.0 rodando na porta ${PORT}`);
-  connectWhatsApp();
+  log(`🚀 Servidor WhatsApp v${SERVER_VERSION} na porta ${PORT}`);
+  startKeepAlive();
+  connectWhatsApp({ source: 'startup' });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  log('SIGTERM recebido, encerrando...');
-  if (sock) sock.end();
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  log('SIGINT recebido, encerrando...');
-  if (sock) sock.end();
-  process.exit(0);
-});
+process.on('SIGTERM', () => { log('⏹️ SIGTERM'); if (sock) try { sock.end(); } catch {} process.exit(0); });
+process.on('SIGINT', () => { log('⏹️ SIGINT'); if (sock) try { sock.end(); } catch {} process.exit(0); });
+process.on('uncaughtException', (err) => { log('💥 Exception:', err.message); });
+process.on('unhandledRejection', (reason) => { log('💥 Rejection:', String(reason)); });
