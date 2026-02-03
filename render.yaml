@@ -1,0 +1,34 @@
+# ============================================
+# RENDER.YAML - Deploy Automático para Render Free
+# ============================================
+# INSTRUÇÕES:
+# 1. Suba este arquivo junto com servidor.js, package.json e Dockerfile
+# 2. No Render, crie um novo "Blueprint" e selecione seu repositório
+# 3. O Render vai detectar este arquivo e criar o serviço automaticamente
+# ============================================
+
+services:
+  - type: web
+    name: whatsapp-server
+    runtime: docker
+    dockerfilePath: ./standalone-project/backend/Dockerfile
+    rootDir: ./standalone-project/backend
+    region: oregon
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: DATA_FOLDER
+        value: ./data
+      - key: KEEPALIVE_INTERVAL
+        value: "240000"
+      - key: SELF_URL
+        sync: false
+    # Disco persistente (opcional - mantém sessão entre deploys)
+    # disk:
+    #   name: whatsapp-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
