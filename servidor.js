@@ -11,7 +11,7 @@
 // 7. Endpoint /diagnostics para debug enterprise
 // ============================================
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast, jidNormalizedUser } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const express = require('express');
@@ -554,6 +554,7 @@ async function connectWhatsApp(options = {}) {
           if (msg.key.remoteJid?.includes('@g.us')) continue;
           if (msg.key.remoteJid?.includes('@newsletter')) continue;
 
+          const realJid = jidNormalizedUser(msg.key.remoteJid);
           rememberContactJid(msg.key.remoteJid);
           rememberContactJid(msg.key.participant);
 
@@ -605,8 +606,10 @@ async function connectWhatsApp(options = {}) {
 
           const newMessage = {
             id: msg.key.id,
-            from: msg.key.remoteJid,
+            from: realJid,
+            phone: realJid.split('@')[0],
             fromMe: msg.key.fromMe,
+
             text: text || '',
             type: Object.keys(msgContent)[0],
             timestamp: Date.now(),
