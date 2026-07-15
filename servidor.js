@@ -227,19 +227,25 @@ const normalizeJid = (recipient) => {
   return knownContactJids.get(formatted) || `${formatted}@s.whatsapp.net`;
 };
 
-const rememberContactJid = (jid) => {
+const rememberContactJid = (jid, pnJid = null) => {
   const raw = String(jid || '').trim();
-
   if (!raw || raw === 'status@broadcast' || raw.includes('@g.us') || raw.includes('@newsletter')) return;
 
-  const bare = raw.split('@')[0].replace(/\D/g, '');
+  const pn = String(pnJid || '').trim();
+
+  // Chave = número puro (extraído do PN se tiver, senão do próprio jid)
+  const source = pn && pn.includes('@s.whatsapp.net') ? pn : raw;
+  const bare = source.split('@')[0].replace(/\D/g, '');
   if (!bare) return;
 
   const current = knownContactJids.get(bare);
 
-  if (raw.includes('@lid') || !current) {
-    knownContactJids.set(bare, raw);
-    if (current !== raw) saveKnownContactJids();
+  // Prioriza @lid como valor salvo (é o que o WhatsApp usa pra rotear)
+  const preferred = raw.includes('@lid') ? raw : (current || raw);
+
+  if (current !== preferred) {
+    knownContactJids.set(bare, preferred);
+    saveKnownContactJids();
   }
 };
 
@@ -554,16 +560,21 @@ async function connectWhatsApp(options = {}) {
           if (msg.key.remoteJid?.includes('@g.us')) continue;
           if (msg.key.remoteJid?.includes('@newsletter')) continue;
 
-          const realJid = jidNormalizedUser(msg.key.remoteJid);
-          rememberContactJid(msg.key.remoteJid);
-          rememberContactJid(msg.key.participant);
+const isLid = msg.key.remoteJid?.endsWith('@lid');
+const senderPn = msg.key.remoteJidAlt || msg.message?.senderPn || msg.key.remoteJid;
 
-          const msgContent = msg.message;
+rememberContactJid(msg.key.remoteJid, senderPn);
 
-          const text =
-            msgContent.conversation ||
-            msgContent.extendedTextMessage?.text ||
-            msgContent.imageMessage?.caption ||
+if (msg.key.participant) {
+  rememberContactJid(msg.key.participant, senderPn);
+}
+
+const msgContent = msg.message;
+
+const text =
+  msgContent.conversation ||
+  msgContent.extendedTextMessage?.text ||
+    msgContent.imageMessage?.caption ||
             msgContent.videoMessage?.caption ||
             '';
 
@@ -604,20 +615,21 @@ async function connectWhatsApp(options = {}) {
 
           const hasMedia = !!mediaType;
 
-          const newMessage = {
-            id: msg.key.id,
-            from: realJid,
-            phone: realJid.split('@')[0],
-            fromMe: msg.key.fromMe,
-
-            text: text || '',
-            type: Object.keys(msgContent)[0],
-            timestamp: Date.now(),
-            pushName: msg.pushName || 'Desconhecido',
-            hasMedia,
-            mediaType,
-            mediaInfo,
-          };
+const newMessage = {
+  id: msg.key.id,
+  from: msg.key.remoteJid,
+  lid: isLid ? msg.key.remoteJid : null,
+  senderPn: senderPn || null,
+  phone: (senderPn || msg.key.remoteJid).split('@')[0],
+  fromMe: msg.key.fromMe,
+  text: text || '',
+  type: Object.keys(msgContent)[0],
+  timestamp: Date.now(),
+  pushName: msg.pushName || 'Desconhecido',
+  hasMedia,
+  mediaType,
+  mediaInfo,
+};
 
           messages.unshift(newMessage);
           if (messages.length > MAX_MESSAGES) messages.pop();
