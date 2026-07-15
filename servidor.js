@@ -1,5 +1,5 @@
 // ============================================
-// SERVIDOR WHATSAPP v5.0.7 - ENTERPRISE GRADE
+// SERVIDOR WHATSAPP v5.0.8 - ENTERPRISE GRADE
 // ============================================
 // CORREÇÕES v5.0.0:
 // 1. Isolamento TOTAL de erros de mídia (não afeta sessão)
@@ -9,6 +9,14 @@
 // 5. Rate limiting básico para evitar spam
 // 6. Métricas de performance para diagnóstico
 // 7. Endpoint /diagnostics para debug enterprise
+// ============================================
+// v5.0.8 (esta versão):
+// A. Autenticação API_TOKEN em rotas sensíveis (send/logout/reset)
+// B. Resolução @lid via sock.onWhatsApp antes de enviar
+// C. Webhook de mensagens recebidas (messages.upsert -> WEBHOOK_URL)
+// D. Status de mensagens persistido em disco (message_status.json)
+// E. mediaErrors isolado de sendErrors
+// F. Rate limit em TODAS as rotas de envio (texto/imagem/audio/video/doc)
 // ============================================
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast, jidNormalizedUser } = require('@whiskeysockets/baileys');
@@ -20,11 +28,56 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-const SERVER_VERSION = '5.0.7';
+const SERVER_VERSION = '5.0.8';
 
-// Cache de status de entrega em memória: id -> { status, updatedAt }
+// ============================================
+// CONFIGURAÇÃO
+// ============================================
+const app = express();
+const PORT = process.env.PORT || 3000;
+const SELF_URL = process.env.SELF_URL || '';
+const DATA_FOLDER = process.env.DATA_FOLDER || './data';
+const AUTH_FOLDER = path.join(DATA_FOLDER, 'auth_info');
+const KEEPALIVE_INTERVAL = parseInt(process.env.KEEPALIVE_INTERVAL) || 240000;
+
+// 🔒 [A] TOKEN DE AUTENTICAÇÃO
+const API_TOKEN = process.env.API_TOKEN || '';
+
+// Timeouts específicos por operação
+// AUMENTADOS para Render Free (conexões lentas)
+const TIMEOUTS = {
+  TEXT: 90000,
+  IMAGE: 180000,
+  AUDIO: 180000,
+  VIDEO: 300000,
+  DOCUMENT: 180000,
+};
+
+// Criar pastas
+fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+
+// ============================================
+// [D] STATUS DE MENSAGENS - PERSISTIDO EM DISCO
+// ============================================
+const MESSAGE_STATUS_FILE = path.join(DATA_FOLDER, 'message_status.json');
 const messageStatusMap = new Map();
 const MESSAGE_STATUS_MAX = 5000;
+
+const loadMessageStatus = () => {
+  try {
+    const raw = fs.readFileSync(MESSAGE_STATUS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v && typeof v === 'object' && v.status) messageStatusMap.set(k, v);
+    }
+  } catch {}
+};
+
+const saveMessageStatus = () => {
+  try {
+    fs.writeFileSync(MESSAGE_STATUS_FILE, JSON.stringify(Object.fromEntries(messageStatusMap)));
+  } catch {}
+};
 
 const setMessageStatus = (id, status) => {
   if (!id || !status) return;
@@ -36,20 +89,31 @@ const setMessageStatus = (id, status) => {
   }
 };
 
+loadMessageStatus();
+setInterval(saveMessageStatus, 30000);
+
 // ============================================
-// WEBHOOK LOVABLE CLOUD (confirmações de entrega)
+// WEBHOOK LOVABLE CLOUD (entrega + [C] recebidas)
 // ============================================
 const crypto = require('crypto');
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 const webhookQueue = [];
 let webhookFlushing = false;
 
 const postWebhook = async (events) => {
-  if (!WEBHOOK_URL || !WEBHOOK_SECRET || !events?.length) return;
+  if (!WEBHOOK_URL || !events?.length) return;
 
   const body = JSON.stringify({ events });
-  const signature = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex');
+  const headers = { 'Content-Type': 'application/json' };
+
+  if (WEBHOOK_SECRET) {
+    headers['x-signature'] = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex');
+  }
+  if (WEBHOOK_TOKEN) {
+    headers['Authorization'] = `Bearer ${WEBHOOK_TOKEN}`;
+  }
 
   try {
     const controller = new AbortController();
@@ -57,10 +121,7 @@ const postWebhook = async (events) => {
 
     const res = await fetch(WEBHOOK_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-signature': signature,
-      },
+      headers,
       body,
       signal: controller.signal,
     });
@@ -74,7 +135,7 @@ const postWebhook = async (events) => {
 };
 
 const enqueueWebhookEvent = (event) => {
-  if (!WEBHOOK_URL || !WEBHOOK_SECRET) return;
+  if (!WEBHOOK_URL) return;
 
   webhookQueue.push(event);
 
@@ -89,29 +150,6 @@ const enqueueWebhookEvent = (event) => {
     if (batch.length) await postWebhook(batch);
   }, 500);
 };
-
-// ============================================
-// CONFIGURAÇÃO
-// ============================================
-const app = express();
-const PORT = process.env.PORT || 3000;
-const SELF_URL = process.env.SELF_URL || '';
-const DATA_FOLDER = process.env.DATA_FOLDER || './data';
-const AUTH_FOLDER = path.join(DATA_FOLDER, 'auth_info');
-const KEEPALIVE_INTERVAL = parseInt(process.env.KEEPALIVE_INTERVAL) || 240000;
-
-// Timeouts específicos por operação
-// AUMENTADOS para Render Free (conexões lentas)
-const TIMEOUTS = {
-  TEXT: 90000,
-  IMAGE: 180000,
-  AUDIO: 180000,
-  VIDEO: 300000,
-  DOCUMENT: 180000,
-};
-
-// Criar pastas
-fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
 // ============================================
 // ESTADO GLOBAL - MACHINE RIGOROSO
@@ -170,10 +208,12 @@ const saveKnownContactJids = () => {
 
 const knownContactJids = loadKnownContactJids();
 
+// [E] mediaErrors isolado de sendErrors
 const metrics = {
   startTime: Date.now(),
   messagesReceived: 0,
   messagesSent: 0,
+  sendErrors: 0,
   mediaErrors: 0,
   connectionDrops: 0,
   lastActivity: null,
@@ -227,6 +267,26 @@ const normalizeJid = (recipient) => {
   return knownContactJids.get(formatted) || `${formatted}@s.whatsapp.net`;
 };
 
+// [B] Resolve JID real via WhatsApp antes de enviar (fix @lid)
+const resolveRealJid = async (jid) => {
+  try {
+    if (!sock || !jid) return jid;
+    if (jid.includes('@lid')) return jid;
+    const phone = jid.split('@')[0].replace(/\D/g, '');
+    if (!phone) return jid;
+    const results = await sock.onWhatsApp(phone);
+    if (results && results[0]?.jid) {
+      const realJid = results[0].jid;
+      log(LogLevel.DEBUG, 'JID resolvido via onWhatsApp', { input: jid, resolved: realJid });
+      return realJid;
+    }
+    return jid;
+  } catch (err) {
+    log(LogLevel.WARN, 'Falha ao resolver JID', { jid, error: err.message });
+    return jid;
+  }
+};
+
 const rememberContactJid = (jid, pnJid = null) => {
   const raw = String(jid || '').trim();
   if (!raw || raw === 'status@broadcast' || raw.includes('@g.us') || raw.includes('@newsletter')) return;
@@ -275,6 +335,32 @@ const updateState = (updates) => {
 
 const canSend = () => {
   return state.isReady && sock && sock.ws?.readyState === sock.ws?.OPEN;
+};
+
+// ============================================
+// [A] MIDDLEWARE DE AUTENTICAÇÃO
+// ============================================
+const requireAuth = (req, res, next) => {
+  if (!API_TOKEN) {
+    log(LogLevel.WARN, 'API_TOKEN não configurado - rota liberada (INSEGURO)');
+    return next();
+  }
+
+  const auth = req.headers.authorization || '';
+  const token = auth.toLowerCase().startsWith('bearer ')
+    ? auth.slice(7).trim()
+    : (req.headers['x-api-token'] || '').trim();
+
+  if (token !== API_TOKEN) {
+    log(LogLevel.WARN, 'Requisição não autorizada', { path: req.path, ip: req.ip });
+    return res.status(401).json({
+      ok: false,
+      success: false,
+      error: 'Não autorizado',
+    });
+  }
+
+  next();
 };
 
 // ============================================
@@ -637,6 +723,16 @@ const newMessage = {
           metrics.messagesReceived++;
           metrics.lastActivity = Date.now();
 
+          // [C] Encaminha mensagens recebidas ao webhook do Lovable
+          if (!msg.key.fromMe) {
+            enqueueWebhookEvent({
+              type: 'message.received',
+              key: msg.key,
+              message: newMessage,
+              timestamp: Math.floor(Date.now() / 1000),
+            });
+          }
+
           log(LogLevel.DEBUG, `Mensagem ${newMessage.fromMe ? 'enviada' : 'recebida'}`, {
             from: newMessage.from?.substring(0, 15),
             type: newMessage.type,
@@ -675,6 +771,7 @@ const newMessage = {
           setMessageStatus(u.key.id, mapped);
 
           enqueueWebhookEvent({
+            type: 'message.status',
             key: u.key,
             status: mapped,
             timestamp: Math.floor(Date.now() / 1000),
@@ -796,6 +893,7 @@ app.get('/whatsapp-status', (req, res) => {
       uptime: Math.floor((Date.now() - metrics.startTime) / 1000),
       messagesReceived: metrics.messagesReceived,
       messagesSent: metrics.messagesSent,
+      sendErrors: metrics.sendErrors,
       mediaErrors: metrics.mediaErrors,
       connectionDrops: metrics.connectionDrops,
     },
@@ -899,95 +997,46 @@ app.get('/connect', (req, res) => {
     .metric-value { font-size: 18px; font-weight: 600; color: #25d366; }
     .success-icon { font-size: 80px; animation: pulse 2s infinite; }
     @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>📱 WhatsApp</h1>
-    <p class="version">VoxyAI CRM Enterprise v${SERVER_VERSION}</p>
-    <div id="qr"><div class="spinner"></div></div>
-    <div id="status" class="status waiting">Inicializando...</div>
-    <div id="actions"></div>
-    <div id="metrics" class="metrics" style="display:none"></div>
-  </div>
+  
 
-  <script>
-    async function check() {
-      try {
-        const r = await fetch('/whatsapp-status');
-        const d = await r.json();
 
-        const qrEl = document.getElementById('qr');
-        const statusEl = document.getElementById('status');
-        const actionsEl = document.getElementById('actions');
-        const metricsEl = document.getElementById('metrics');
+  
 
-        if (d.isReady) {
-          qrEl.innerHTML = '<div class="success-icon">✅</div><p style="margin-top:12px;color:rgba(255,255,255,0.7)">Sessão: ' + (d.sessionInfo?.name || 'Conectado') + '</p>';
-          statusEl.className = 'status ready';
-          statusEl.textContent = 'PRONTO - Enviando e recebendo';
-          actionsEl.innerHTML = '<button class="btn btn-danger" onclick="reset()">Desconectar</button>';
 
-          metricsEl.style.display = 'grid';
-          metricsEl.innerHTML =
-            '<div class="metric"><div class="metric-label">Mensagens Recebidas</div><div class="metric-value">' + (d.metrics?.messagesReceived || 0) + '</div></div>' +
-            '<div class="metric"><div class="metric-label">Mensagens Enviadas</div><div class="metric-value">' + (d.metrics?.messagesSent || 0) + '</div></div>' +
-            '<div class="metric"><div class="metric-label">Uptime</div><div class="metric-value">' + formatUptime(d.metrics?.uptime) + '</div></div>' +
-            '<div class="metric"><div class="metric-label">Drops</div><div class="metric-value">' + (d.metrics?.connectionDrops || 0) + '</div></div>';
-        } else if (d.isConnected) {
-          qrEl.innerHTML = '<div style="font-size:64px">🔌</div>';
-          statusEl.className = 'status connected';
-          statusEl.textContent = 'Conectado - Sincronizando...';
-          actionsEl.innerHTML = '';
-          metricsEl.style.display = 'none';
-        } else if (d.qrCode) {
-          qrEl.innerHTML = '<img src="' + d.qrCode + '" alt="QR Code"><p style="margin-top:12px;font-size:13px;color:rgba(255,255,255,0.6)">Escaneie com seu WhatsApp</p>';
-          statusEl.className = 'status waiting';
-          statusEl.textContent = 'Aguardando scan do QR Code';
-          actionsEl.innerHTML = '<button class="btn" onclick="reset()">Gerar novo QR</button>';
-          metricsEl.style.display = 'none';
-        } else if (d.lastError) {
-          qrEl.innerHTML = '<div style="font-size:64px">⚠️</div><p style="margin-top:12px;color:rgba(255,255,255,0.6)">' + d.lastError + '</p>';
-          statusEl.className = 'status error';
-          statusEl.textContent = 'Erro na conexão';
-          actionsEl.innerHTML = '<button class="btn" onclick="reset()">Tentar novamente</button>';
-          metricsEl.style.display = 'none';
-        } else {
-          qrEl.innerHTML = '<div class="spinner"></div>';
-          statusEl.className = 'status waiting';
-          statusEl.textContent = 'Gerando QR Code...';
-          actionsEl.innerHTML = '<button class="btn" onclick="reset()">Forçar geração</button>';
-          metricsEl.style.display = 'none';
-        }
-      } catch (e) {
-        document.getElementById('status').className = 'status error';
-        document.getElementById('status').textContent = 'Servidor offline';
-      }
-    }
+    
 
-    function formatUptime(seconds) {
-      if (!seconds) return '0s';
-      if (seconds < 60) return seconds + 's';
-      if (seconds < 3600) return Math.floor(seconds / 60) + 'min';
-      return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'min';
-    }
+📱 WhatsApp
 
-    async function reset() {
-      await fetch('/force-reset', { method: 'POST' });
-      setTimeout(check, 2000);
-    }
 
-    check();
-    setInterval(check, 2000);
-  </script>
-</body>
-</html>`);
+    
+
+VoxyAI CRM Enterprise v${SERVER_VERSION}
+
+
+    
+
+
+    
+
+Inicializando...
+
+
+    
+
+
+    
+
+
+
+  
+
+`);
 });
 
 // ============================================
 // ROTAS - ENVIAR MENSAGENS
 // ============================================
-async function sendWithIsolation(operation, timeout) {
+async function sendWithIsolation(operation, timeout, isMedia = false) {
   const start = Date.now();
 
   try {
@@ -1006,9 +1055,11 @@ async function sendWithIsolation(operation, timeout) {
 
     return { success: true, result, latency };
   } catch (err) {
-    log(LogLevel.ERROR, 'Erro no envio (ISOLADO)', { error: err.message });
+    log(LogLevel.ERROR, 'Erro no envio (ISOLADO)', { error: err.message, isMedia });
 
-    metrics.mediaErrors++;
+    // [E] isola mediaErrors de sendErrors
+    if (isMedia) metrics.mediaErrors++;
+    else metrics.sendErrors++;
 
     return { success: false, error: err.message };
   }
@@ -1044,7 +1095,7 @@ const handleSendText = async (req, res) => {
     });
   }
 
-  const jid = normalizeJid(phone);
+  let jid = normalizeJid(phone);
 
   if (!jid || !jid.includes('@')) {
     return res.status(400).json({
@@ -1055,9 +1106,13 @@ const handleSendText = async (req, res) => {
     });
   }
 
+  // [B] Resolve JID real antes de enviar
+  jid = await resolveRealJid(jid);
+
   const { success, result, error, latency } = await sendWithIsolation(
     () => sock.sendMessage(jid, { text }),
-    TIMEOUTS.TEXT
+    TIMEOUTS.TEXT,
+    false
   );
 
   if (success) {
@@ -1087,11 +1142,12 @@ const handleSendText = async (req, res) => {
   });
 };
 
-app.post('/send', handleSendText);
-app.post('/send-message', handleSendText);
-app.post('/message', handleSendText);
+// [A] requireAuth em todas as rotas sensíveis
+app.post('/send', requireAuth, handleSendText);
+app.post('/send-message', requireAuth, handleSendText);
+app.post('/message', requireAuth, handleSendText);
 
-app.post('/send-image', async (req, res) => {
+app.post('/send-image', requireAuth, async (req, res) => {
   const phone = req.body.to || req.body.phone;
   const imageData = req.body.url || req.body.image;
   const caption = req.body.caption || '';
@@ -1112,7 +1168,17 @@ app.post('/send-image', async (req, res) => {
     });
   }
 
-  const jid = normalizeJid(phone);
+  // [F] rate limit em mídia
+  if (!checkRateLimit(phone)) {
+    return res.status(429).json({
+      ok: false,
+      success: false,
+      error: 'Rate limit excedido',
+    });
+  }
+
+  let jid = normalizeJid(phone);
+  jid = await resolveRealJid(jid);
 
   const imagePayload =
     typeof imageData === 'string' && imageData.startsWith('http')
@@ -1121,7 +1187,8 @@ app.post('/send-image', async (req, res) => {
 
   const { success, result, error, latency } = await sendWithIsolation(
     () => sock.sendMessage(jid, { image: imagePayload, caption }),
-    TIMEOUTS.IMAGE
+    TIMEOUTS.IMAGE,
+    true
   );
 
   if (success) {
@@ -1148,7 +1215,7 @@ app.post('/send-image', async (req, res) => {
   });
 });
 
-app.post('/send-audio', async (req, res) => {
+app.post('/send-audio', requireAuth, async (req, res) => {
   const phone = req.body.to || req.body.phone;
   const audioData = req.body.url || req.body.audio;
   const ptt = req.body.ptt !== false;
@@ -1169,7 +1236,16 @@ app.post('/send-audio', async (req, res) => {
     });
   }
 
-  const jid = normalizeJid(phone);
+  if (!checkRateLimit(phone)) {
+    return res.status(429).json({
+      ok: false,
+      success: false,
+      error: 'Rate limit excedido',
+    });
+  }
+
+  let jid = normalizeJid(phone);
+  jid = await resolveRealJid(jid);
 
   const receivedMimetype = req.body.mimetype || 'não especificado';
 
@@ -1196,7 +1272,8 @@ app.post('/send-audio', async (req, res) => {
         mimetype: finalMimetype,
         ptt,
       }),
-    TIMEOUTS.AUDIO
+    TIMEOUTS.AUDIO,
+    true
   );
 
   if (success) {
@@ -1232,7 +1309,7 @@ app.post('/send-audio', async (req, res) => {
   });
 });
 
-app.post('/send-video', async (req, res) => {
+app.post('/send-video', requireAuth, async (req, res) => {
   const phone = req.body.to || req.body.phone;
   const videoData = req.body.url || req.body.video;
   const caption = req.body.caption || '';
@@ -1253,7 +1330,16 @@ app.post('/send-video', async (req, res) => {
     });
   }
 
-  const jid = normalizeJid(phone);
+  if (!checkRateLimit(phone)) {
+    return res.status(429).json({
+      ok: false,
+      success: false,
+      error: 'Rate limit excedido',
+    });
+  }
+
+  let jid = normalizeJid(phone);
+  jid = await resolveRealJid(jid);
 
   const videoPayload =
     typeof videoData === 'string' && videoData.startsWith('http')
@@ -1262,7 +1348,8 @@ app.post('/send-video', async (req, res) => {
 
   const { success, result, error, latency } = await sendWithIsolation(
     () => sock.sendMessage(jid, { video: videoPayload, caption }),
-    TIMEOUTS.VIDEO
+    TIMEOUTS.VIDEO,
+    true
   );
 
   if (success) {
@@ -1289,7 +1376,7 @@ app.post('/send-video', async (req, res) => {
   });
 });
 
-app.post('/send-document', async (req, res) => {
+app.post('/send-document', requireAuth, async (req, res) => {
   const phone = req.body.to || req.body.phone;
   const docData = req.body.url || req.body.document;
   const filename = req.body.filename || 'documento';
@@ -1310,7 +1397,16 @@ app.post('/send-document', async (req, res) => {
     });
   }
 
-  const jid = normalizeJid(phone);
+  if (!checkRateLimit(phone)) {
+    return res.status(429).json({
+      ok: false,
+      success: false,
+      error: 'Rate limit excedido',
+    });
+  }
+
+  let jid = normalizeJid(phone);
+  jid = await resolveRealJid(jid);
 
   const docPayload =
     typeof docData === 'string' && docData.startsWith('http')
@@ -1324,7 +1420,8 @@ app.post('/send-document', async (req, res) => {
         fileName: filename,
         mimetype: req.body.mimetype || 'application/octet-stream',
       }),
-    TIMEOUTS.DOCUMENT
+    TIMEOUTS.DOCUMENT,
+    true
   );
 
   if (success) {
@@ -1369,7 +1466,7 @@ app.get('/messages', (req, res) => {
   });
 });
 
-app.post('/logout', async (req, res) => {
+app.post('/logout', requireAuth, async (req, res) => {
   log(LogLevel.INFO, 'Logout solicitado');
 
   cancelPendingReconnect();
@@ -1413,7 +1510,7 @@ app.post('/logout', async (req, res) => {
   });
 });
 
-app.post('/force-reset', async (req, res) => {
+app.post('/force-reset', requireAuth, async (req, res) => {
   log(LogLevel.INFO, 'Force reset solicitado');
 
   cancelPendingReconnect();
@@ -1476,6 +1573,8 @@ app.listen(PORT, () => {
 process.on('SIGTERM', () => {
   log(LogLevel.INFO, 'SIGTERM - Encerrando');
 
+  saveMessageStatus();
+
   if (sock) {
     try {
       sock.end();
@@ -1487,6 +1586,8 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
   log(LogLevel.INFO, 'SIGINT - Encerrando');
+
+  saveMessageStatus();
 
   if (sock) {
     try {
