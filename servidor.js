@@ -1,5 +1,5 @@
 // ============================================
-// SERVIDOR WHATSAPP v5.0.8 - ENTERPRISE GRADE
+// SERVIDOR WHATSAPP v5.0.9 - ENTERPRISE GRADE
 // ============================================
 // CORREÇÕES v5.0.0:
 // 1. Isolamento TOTAL de erros de mídia (não afeta sessão)
@@ -10,13 +10,19 @@
 // 6. Métricas de performance para diagnóstico
 // 7. Endpoint /diagnostics para debug enterprise
 // ============================================
-// v5.0.8 (esta versão):
+// v5.0.8:
 // A. Autenticação API_TOKEN em rotas sensíveis (send/logout/reset)
 // B. Resolução @lid via sock.onWhatsApp antes de enviar
 // C. Webhook de mensagens recebidas (messages.upsert -> WEBHOOK_URL)
 // D. Status de mensagens persistido em disco (message_status.json)
 // E. mediaErrors isolado de sendErrors
 // F. Rate limit em TODAS as rotas de envio (texto/imagem/audio/video/doc)
+// ============================================
+// v5.0.9 (esta versão):
+// G. Endpoint GET /lid/:id resolvendo LID -> telefone real (crítico p/ tráfego frio)
+// H. Endpoint GET /contacts/:id como fallback compatível
+// I. senderPn / participantPn no TOPO do evento webhook (não só dentro de message)
+// J. Rota /resolve-lid?lid=... como alias adicional
 // ============================================
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast, jidNormalizedUser } = require('@whiskeysockets/baileys');
@@ -28,7 +34,7 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-const SERVER_VERSION = '5.0.8';
+const SERVER_VERSION = '5.0.9';
 
 // ============================================
 // CONFIGURAÇÃO
@@ -188,6 +194,43 @@ const messages = [];
 const MAX_MESSAGES = 200;
 const CONTACT_JIDS_FILE = path.join(DATA_FOLDER, 'contact_jids.json');
 
+// 🔥 NOVO v5.0.9: mapa LID -> telefone real (persistido)
+const LID_MAP_FILE = path.join(DATA_FOLDER, 'lid_map.json');
+
+const loadLidMap = () => {
+  try {
+    const raw = fs.readFileSync(LID_MAP_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return new Map(Object.entries(parsed).filter(([, v]) => typeof v === 'string'));
+  } catch {
+    return new Map();
+  }
+};
+
+const saveLidMap = () => {
+  try {
+    fs.writeFileSync(LID_MAP_FILE, JSON.stringify(Object.fromEntries(lidToPhoneMap), null, 2));
+  } catch (err) {
+    console.log('[LID-MAP] erro ao salvar:', err.message);
+  }
+};
+
+const lidToPhoneMap = loadLidMap();
+
+const rememberLidMapping = (lid, phoneJid) => {
+  if (!lid || !phoneJid) return;
+  const lidClean = String(lid).trim();
+  const phoneClean = String(phoneJid).trim();
+  if (!lidClean.includes('@lid')) return;
+  const digits = phoneClean.split('@')[0].replace(/\D/g, '');
+  if (!digits) return;
+  const current = lidToPhoneMap.get(lidClean);
+  if (current !== digits) {
+    lidToPhoneMap.set(lidClean, digits);
+    saveLidMap();
+  }
+};
+
 const loadKnownContactJids = () => {
   try {
     const raw = fs.readFileSync(CONTACT_JIDS_FILE, 'utf8');
@@ -306,6 +349,11 @@ const rememberContactJid = (jid, pnJid = null) => {
   if (current !== preferred) {
     knownContactJids.set(bare, preferred);
     saveKnownContactJids();
+  }
+
+  // 🔥 NOVO v5.0.9: se tem LID + PN, guarda mapeamento reverso pra consulta
+  if (raw.includes('@lid') && pn.includes('@s.whatsapp.net')) {
+    rememberLidMapping(raw, pn);
   }
 };
 
@@ -448,6 +496,64 @@ function trackDisconnect(statusCode) {
   lastDisconnectAt = now;
 
   return { disconnectStreak };
+}
+
+// 🔥 NOVO v5.0.9: resolve LID -> telefone real (usado no endpoint e no webhook)
+async function resolveLidToPhone(lidOrJid) {
+  const input = String(lidOrJid || '').trim();
+  if (!input) return null;
+
+  // Se já veio um número puro / s.whatsapp.net, extrai direto
+  if (!input.includes('@lid')) {
+    const digits = input.split('@')[0].replace(/\D/g, '');
+    return digits || null;
+  }
+
+  // 1. Cache local (populado quando chegam mensagens com senderPn)
+  const cached = lidToPhoneMap.get(input);
+  if (cached) return cached;
+
+  // 2. Tenta store do Baileys (contacts)
+  try {
+    const contacts = sock?.store?.contacts || {};
+    const contact = contacts[input];
+    if (contact) {
+      const candidate = contact.id || contact.jid || contact.phoneNumber || contact.number;
+      if (candidate && !String(candidate).includes('@lid')) {
+        const digits = String(candidate).split('@')[0].replace(/\D/g, '');
+        if (digits) {
+          lidToPhoneMap.set(input, digits);
+          saveLidMap();
+          return digits;
+        }
+      }
+    }
+  } catch {}
+
+  // 3. Tenta signalRepository.lidMapping (Baileys moderno)
+  try {
+    const mapping = sock?.signalRepository?.lidMapping;
+    if (mapping) {
+      const digitsOnly = input.split('@')[0].replace(/\D/g, '');
+      const candidates = [
+        typeof mapping.getPNForLID === 'function' ? await mapping.getPNForLID(input) : null,
+        typeof mapping.getPNForLID === 'function' ? await mapping.getPNForLID(digitsOnly) : null,
+        typeof mapping.getPhoneNumber === 'function' ? await mapping.getPhoneNumber(input) : null,
+      ];
+      for (const c of candidates) {
+        if (c && !String(c).includes('@lid')) {
+          const d = String(c).split('@')[0].replace(/\D/g, '');
+          if (d) {
+            lidToPhoneMap.set(input, d);
+            saveLidMap();
+            return d;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  return null;
 }
 
 // ============================================
@@ -639,28 +745,39 @@ async function connectWhatsApp(options = {}) {
       }
     });
 
-    sock.ev.on('messages.upsert', ({ messages: msgs }) => {
+    sock.ev.on('messages.upsert', async ({ messages: msgs }) => {
       for (const msg of msgs) {
         try {
           if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
           if (msg.key.remoteJid?.includes('@g.us')) continue;
           if (msg.key.remoteJid?.includes('@newsletter')) continue;
 
-const isLid = msg.key.remoteJid?.endsWith('@lid');
-const senderPn = msg.key.remoteJidAlt || msg.message?.senderPn || msg.key.remoteJid;
+          const isLid = msg.key.remoteJid?.endsWith('@lid');
+          const senderPn = msg.key.senderPn || msg.key.remoteJidAlt || msg.message?.senderPn || null;
+          const participantPn = msg.key.participantPn || null;
 
-rememberContactJid(msg.key.remoteJid, senderPn);
+          rememberContactJid(msg.key.remoteJid, senderPn);
 
-if (msg.key.participant) {
-  rememberContactJid(msg.key.participant, senderPn);
-}
+          if (msg.key.participant) {
+            rememberContactJid(msg.key.participant, senderPn);
+          }
 
-const msgContent = msg.message;
+          // 🔥 NOVO v5.0.9: se é LID e não temos senderPn, tenta resolver na hora
+          let resolvedPhone = null;
+          if (senderPn && senderPn.includes('@s.whatsapp.net')) {
+            resolvedPhone = senderPn.split('@')[0].replace(/\D/g, '');
+          } else if (isLid) {
+            resolvedPhone = await resolveLidToPhone(msg.key.remoteJid);
+          } else {
+            resolvedPhone = msg.key.remoteJid.split('@')[0].replace(/\D/g, '');
+          }
 
-const text =
-  msgContent.conversation ||
-  msgContent.extendedTextMessage?.text ||
-    msgContent.imageMessage?.caption ||
+          const msgContent = msg.message;
+
+          const text =
+            msgContent.conversation ||
+            msgContent.extendedTextMessage?.text ||
+            msgContent.imageMessage?.caption ||
             msgContent.videoMessage?.caption ||
             '';
 
@@ -701,21 +818,22 @@ const text =
 
           const hasMedia = !!mediaType;
 
-const newMessage = {
-  id: msg.key.id,
-  from: msg.key.remoteJid,
-  lid: isLid ? msg.key.remoteJid : null,
-  senderPn: senderPn || null,
-  phone: (senderPn || msg.key.remoteJid).split('@')[0],
-  fromMe: msg.key.fromMe,
-  text: text || '',
-  type: Object.keys(msgContent)[0],
-  timestamp: Date.now(),
-  pushName: msg.pushName || 'Desconhecido',
-  hasMedia,
-  mediaType,
-  mediaInfo,
-};
+          const newMessage = {
+            id: msg.key.id,
+            from: msg.key.remoteJid,
+            lid: isLid ? msg.key.remoteJid : null,
+            senderPn: senderPn || null,
+            participantPn: participantPn || null,
+            phone: resolvedPhone || (senderPn || msg.key.remoteJid).split('@')[0],
+            fromMe: msg.key.fromMe,
+            text: text || '',
+            type: Object.keys(msgContent)[0],
+            timestamp: Date.now(),
+            pushName: msg.pushName || 'Desconhecido',
+            hasMedia,
+            mediaType,
+            mediaInfo,
+          };
 
           messages.unshift(newMessage);
           if (messages.length > MAX_MESSAGES) messages.pop();
@@ -723,11 +841,16 @@ const newMessage = {
           metrics.messagesReceived++;
           metrics.lastActivity = Date.now();
 
-          // [C] Encaminha mensagens recebidas ao webhook do Lovable
+          // [C] + 🔥 [I] v5.0.9: senderPn / phone no TOPO do evento, não só dentro de message
           if (!msg.key.fromMe) {
             enqueueWebhookEvent({
               type: 'message.received',
               key: msg.key,
+              senderPn: senderPn || null,
+              participantPn: participantPn || null,
+              phone: resolvedPhone || null,
+              number: resolvedPhone || null,
+              lid: isLid ? msg.key.remoteJid : null,
               message: newMessage,
               timestamp: Math.floor(Date.now() / 1000),
             });
@@ -735,6 +858,7 @@ const newMessage = {
 
           log(LogLevel.DEBUG, `Mensagem ${newMessage.fromMe ? 'enviada' : 'recebida'}`, {
             from: newMessage.from?.substring(0, 15),
+            phone: newMessage.phone,
             type: newMessage.type,
             hasMedia,
             mediaType,
@@ -780,6 +904,25 @@ const newMessage = {
           log(LogLevel.WARN, 'Erro em messages.update', err.message);
         }
       }
+    });
+
+    // 🔥 NOVO v5.0.9: escuta atualizações de contatos p/ popular lid_map
+    sock.ev.on('contacts.upsert', (contacts) => {
+      try {
+        for (const c of contacts || []) {
+          if (c?.id && c?.lid) rememberLidMapping(c.lid, c.id);
+          if (c?.id?.includes('@lid') && c?.phoneNumber) rememberLidMapping(c.id, c.phoneNumber);
+        }
+      } catch {}
+    });
+
+    sock.ev.on('contacts.update', (contacts) => {
+      try {
+        for (const c of contacts || []) {
+          if (c?.id && c?.lid) rememberLidMapping(c.lid, c.id);
+          if (c?.id?.includes('@lid') && c?.phoneNumber) rememberLidMapping(c.id, c.phoneNumber);
+        }
+      } catch {}
     });
   } catch (err) {
     log(LogLevel.ERROR, 'Erro na conexão', err.message);
@@ -863,6 +1006,64 @@ app.get('/message-status', (req, res) => {
   res.json({ statuses });
 });
 
+// ============================================
+// 🔥 NOVO v5.0.9: RESOLUÇÃO DE LID -> TELEFONE REAL
+// ============================================
+// GET /lid/:id      -> resolve LID em telefone real
+// GET /contacts/:id -> alias compatível (o app tenta essa rota também)
+// GET /resolve-lid?lid=...
+// Retorna { phone: "5511...", jid: "5511...@s.whatsapp.net", found: true }
+
+const lidLookupHandler = async (req, res) => {
+  const raw = req.params.id || req.query.lid || req.query.jid || '';
+  const identifier = decodeURIComponent(String(raw).trim());
+
+  if (!identifier) {
+    return res.status(400).json({ ok: false, error: 'id obrigatório', found: false });
+  }
+
+  try {
+    const phone = await resolveLidToPhone(identifier);
+
+    if (phone) {
+      return res.json({
+        ok: true,
+        found: true,
+        input: identifier,
+        phone,
+        number: phone,
+        jid: `${phone}@s.whatsapp.net`,
+      });
+    }
+
+    return res.status(404).json({
+      ok: false,
+      found: false,
+      input: identifier,
+      error: 'LID não mapeado ainda. Ele será resolvido quando o contato mandar mensagem com senderPn.',
+    });
+  } catch (err) {
+    log(LogLevel.WARN, 'Erro em lidLookupHandler', { error: err.message });
+    return res.status(500).json({ ok: false, found: false, error: err.message });
+  }
+};
+
+app.get('/lid/:id', lidLookupHandler);
+app.get('/contacts/:id', lidLookupHandler);
+app.get('/contact/:id', lidLookupHandler);
+app.get('/api/contacts/:id', lidLookupHandler);
+app.get('/api/lid/:id', lidLookupHandler);
+app.get('/jid/:id', lidLookupHandler);
+app.get('/resolve-lid', lidLookupHandler);
+app.get('/resolve', lidLookupHandler);
+
+// Lista completa do mapa LID -> phone (útil pra debug)
+app.get('/lid-mappings', (req, res) => {
+  const out = {};
+  for (const [k, v] of lidToPhoneMap.entries()) out[k] = v;
+  res.json({ ok: true, count: lidToPhoneMap.size, mappings: out });
+});
+
 app.get('/status', (req, res) => {
   res.json({
     ...state,
@@ -919,6 +1120,7 @@ app.get('/diagnostics', (req, res) => {
     },
     routing: {
       knownContactJids: knownContactJids.size,
+      lidMappings: lidToPhoneMap.size,
     },
     session: {
       folder: AUTH_FOLDER,
@@ -928,6 +1130,7 @@ app.get('/diagnostics', (req, res) => {
     recentMessages: messages.slice(0, 10).map((m) => ({
       id: m.id,
       from: m.from?.substring(0, 15) + '...',
+      phone: m.phone,
       fromMe: m.fromMe,
       type: m.type,
       timestamp: m.timestamp,
@@ -997,40 +1200,17 @@ app.get('/connect', (req, res) => {
     .metric-value { font-size: 18px; font-weight: 600; color: #25d366; }
     .success-icon { font-size: 80px; animation: pulse 2s infinite; }
     @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
-  
-
-
-  
-
-
-    
-
-📱 WhatsApp
-
-
-    
-
-VoxyAI CRM Enterprise v${SERVER_VERSION}
-
-
-    
-
-
-    
-
-Inicializando...
-
-
-    
-
-
-    
-
-
-
-  
-
-`);
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>📱 WhatsApp</h1>
+    <div class="version">VoxyAI CRM Enterprise v${SERVER_VERSION}</div>
+    <div id="qr"><div class="spinner"></div></div>
+    <div id="status" class="status waiting">Inicializando...</div>
+  </div>
+</body>
+</html>`);
 });
 
 // ============================================
@@ -1574,6 +1754,7 @@ process.on('SIGTERM', () => {
   log(LogLevel.INFO, 'SIGTERM - Encerrando');
 
   saveMessageStatus();
+  saveLidMap();
 
   if (sock) {
     try {
@@ -1588,6 +1769,7 @@ process.on('SIGINT', () => {
   log(LogLevel.INFO, 'SIGINT - Encerrando');
 
   saveMessageStatus();
+  saveLidMap();
 
   if (sock) {
     try {
